@@ -100,9 +100,40 @@ def make_sandbox(tmp: Path):
     fake = tmp / "fake_codex.py"
     fake.write_text(
         "#!/usr/bin/env python3\n"
-        "import os, sys, json\n"
-        "open(os.environ['FAKE_CODEX_LOG'], 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
-        "print('Queued message 123 for thread abc')\n",
+        "import json, os, sys\n"
+        "def _log(args):\n"
+        "    path = os.environ.get('FAKE_CODEX_LOG')\n"
+        "    if path:\n"
+        "        open(path, 'a').write(json.dumps(args) + '\\n')\n"
+        "if 'app-server' in sys.argv:\n"
+        "    outcome = os.environ.get('FAKE_RESET_OUTCOME', 'reset')\n"
+        "    count = os.environ.get('FAKE_RESET_CREDITS', '1')\n"
+        "    while True:\n"
+        "        line = sys.stdin.readline()\n"
+        "        if not line:\n"
+        "            break\n"
+        "        line = line.strip()\n"
+        "        if not line:\n"
+        "            continue\n"
+        "        try:\n"
+        "            msg = json.loads(line)\n"
+        "        except ValueError:\n"
+        "            continue\n"
+        "        if msg.get('id') is None:\n"
+        "            continue\n"
+        "        method = msg.get('method')\n"
+        "        if method == 'account/rateLimitResetCredit/consume':\n"
+        "            _log(['consume', (msg.get('params') or {}).get('idempotencyKey', '')])\n"
+        "            result = {'outcome': outcome}\n"
+        "        elif method == 'account/rateLimits/read':\n"
+        "            result = {'rateLimitResetCredits': {'availableCount': int(count)}}\n"
+        "        else:\n"
+        "            result = {}\n"
+        "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': result}) + '\\n')\n"
+        "        sys.stdout.flush()\n"
+        "else:\n"
+        "    _log(sys.argv[1:])\n"
+        "    print('Queued message 123 for thread abc')\n",
         encoding="utf-8",
     )
     fake.chmod(0o755)
@@ -115,6 +146,8 @@ def make_sandbox(tmp: Path):
             "CODEX_AUTO_STARTSTOP_CODEX_BIN": f"{PY} {fake}",
             "CODEX_AUTO_STARTSTOP_NO_SPAWN": "1",
             "FAKE_CODEX_LOG": str(fake_log),
+            "FAKE_RESET_OUTCOME": "reset",
+            "FAKE_RESET_CREDITS": "1",
         }
     )
     return home, sessions, env, fake_log
@@ -378,6 +411,99 @@ def test_both_trigger_picks_weekly(tmp: Path) -> None:
     check("steered_limit=weekly", st.get("steered_limit") == "weekly", str(st))
 
 
+
+def _credit_calls(fake_log: Path) -> list:
+    return [c for c in fake_calls(fake_log) if c and c[0] == "consume"]
+
+
+def test_credit_weekly_resets(tmp: Path) -> None:
+    print("test: reset credit clears a near-limit weekly window (no handoff)")
+    home, sessions, env, fake_log = make_sandbox(tmp)
+    write_config(home, use_reset_credits=True, reset_credit_on="weekly")
+    write_rollout(
+        sessions,
+        used=20.0,
+        resets_at=time.time() + 3600,
+        weekly_used=95.0,
+        weekly_resets=time.time() + 500000,
+    )
+    proc = run_cli(["stop"], env, hook_input())
+    check("exit 0", proc.returncode == 0, proc.stderr[-200:])
+    check("no handoff (no output)", proc.stdout.strip() == "", proc.stdout[:200])
+    check("credit redeemed once", len(_credit_calls(fake_log)) == 1, str(_credit_calls(fake_log)))
+    st = state(home)["threads"].get(SID, {})
+    check("reset_credit_for recorded", bool(st.get("reset_credit_for")), str(st))
+    check("no resume scheduled", not st.get("resume_at"), str(st))
+
+
+def test_credit_not_spent_on_5h_alone(tmp: Path) -> None:
+    print("test: 5h near limit with weekly far -> handoff, no credit")
+    home, sessions, env, fake_log = make_sandbox(tmp)
+    write_config(home, use_reset_credits=True, reset_credit_on="weekly")
+    write_rollout(
+        sessions,
+        used=92.0,
+        resets_at=time.time() + 3600,
+        weekly_used=20.0,
+        weekly_resets=time.time() + 500000,
+    )
+    proc = run_cli(["stop"], env, hook_input())
+    out = _json(proc.stdout)
+    check("decision=block (handoff)", out.get("decision") == "block", proc.stdout[:200])
+    check("no credit redeemed", _credit_calls(fake_log) == [], str(_credit_calls(fake_log)))
+
+
+def test_credit_unavailable_falls_back(tmp: Path) -> None:
+    print("test: no credit available -> handoff")
+    home, sessions, env, fake_log = make_sandbox(tmp)
+    env["FAKE_RESET_OUTCOME"] = "noCredit"
+    write_config(home, use_reset_credits=True, reset_credit_on="weekly")
+    write_rollout(
+        sessions,
+        used=20.0,
+        resets_at=time.time() + 3600,
+        weekly_used=95.0,
+        weekly_resets=time.time() + 500000,
+    )
+    proc = run_cli(["stop"], env, hook_input())
+    out = _json(proc.stdout)
+    check("decision=block (handoff)", out.get("decision") == "block", proc.stdout[:200])
+    check("credit attempted once", len(_credit_calls(fake_log)) == 1, str(_credit_calls(fake_log)))
+
+
+def test_credit_on_5h(tmp: Path) -> None:
+    print("test: reset_credit_on=5h redeems on the 5h threshold")
+    home, sessions, env, fake_log = make_sandbox(tmp)
+    write_config(home, use_reset_credits=True, reset_credit_on="5h")
+    write_rollout(
+        sessions,
+        used=92.0,
+        resets_at=time.time() + 3600,
+        weekly_used=20.0,
+        weekly_resets=time.time() + 500000,
+    )
+    proc = run_cli(["stop"], env, hook_input())
+    check("no handoff (no output)", proc.stdout.strip() == "", proc.stdout[:200])
+    check("credit redeemed once", len(_credit_calls(fake_log)) == 1, str(_credit_calls(fake_log)))
+
+
+def test_credit_once_per_window(tmp: Path) -> None:
+    print("test: credit is redeemed once per window (idempotent)")
+    home, sessions, env, fake_log = make_sandbox(tmp)
+    write_config(home, use_reset_credits=True, reset_credit_on="weekly")
+    resets = time.time() + 500000
+    write_rollout(
+        sessions, used=20.0, resets_at=time.time() + 3600, weekly_used=95.0, weekly_resets=resets
+    )
+    run_cli(["stop"], env, hook_input())
+    # the reset takes effect: the same window now reads low
+    write_rollout(
+        sessions, used=5.0, resets_at=time.time() + 3600, weekly_used=5.0, weekly_resets=resets
+    )
+    proc = run_cli(["stop"], env, hook_input())
+    check("second run: no output", proc.stdout.strip() == "", proc.stdout[:200])
+    check("credit redeemed exactly once", len(_credit_calls(fake_log)) == 1, str(_credit_calls(fake_log)))
+
 def main() -> int:
     tests = [
         test_below_threshold,
@@ -391,7 +517,13 @@ def main() -> int:
         test_weekly_trigger,
         test_weekly_ignored_when_trigger_5h,
         test_both_trigger_picks_5h,
+        test_both_trigger_picks_5h,
         test_both_trigger_picks_weekly,
+        test_credit_weekly_resets,
+        test_credit_not_spent_on_5h_alone,
+        test_credit_unavailable_falls_back,
+        test_credit_on_5h,
+        test_credit_once_per_window,
     ]
     for fn in tests:
         with tempfile.TemporaryDirectory(prefix="auto-startstop-test-") as td:

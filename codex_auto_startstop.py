@@ -21,6 +21,10 @@ two hooks plus a tiny resume scheduler:
 
 TRIGGER ("5h" | "weekly" | "both") selects which limit drives the stop/resume.
 
+RESET CREDITS (use_reset_credits=true) spend Codex's "usage limit resets" instead
+of writing a handoff, for the window named by reset_credit_on ("weekly" | "5h" |
+"both"). No credit available -> normal handoff.
+
 Everything is fail-open: if anything goes wrong the hook prints nothing and exits 0,
 so it can never break a Codex session.
 
@@ -29,6 +33,7 @@ Subcommands (used by Codex hooks / install / humans):
   session-start   hook entry point (stdin: Codex SessionStart hook JSON)
   sleeper         background helper (detached); one-shot with --once
   status          show rate-limit + auto-startstop state for a session
+  credits         show available usage-limit reset credits (app-server RPC)
   install         install hooks.json + seed hook trust; copy this script into CODEX_HOME
   uninstall       remove hooks and trust entries
   fetch-hashes    internal: ask Codex for current hook hashes (app-server RPC)
@@ -55,6 +60,7 @@ import subprocess
 import sys
 import time
 import traceback
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -67,6 +73,8 @@ VERSION = "1.0.0"
 
 DEFAULT_CONFIG = {
     "trigger": "5h",
+    "use_reset_credits": False,
+    "reset_credit_on": "weekly",
     "stop_percent": 85.0,
     "stop_percent_weekly": 90.0,
     "resume_buffer_sec": 90,
@@ -216,10 +224,18 @@ def _limit_label(name: str) -> str:
 def _trigger_windows(cfg: dict) -> list:
     t = str(cfg.get("trigger", "5h")).strip().lower()
     if t in ("both", "auto", "either", "all"):
-        return ["5h", "weekly"]
-    if t in ("weekly", "7d", "secondary"):
-        return ["weekly"]
-    return ["5h"]
+        names = ["5h", "weekly"]
+    elif t in ("weekly", "7d", "secondary"):
+        names = ["weekly"]
+    else:
+        names = ["5h"]
+    # A window that can spend a credit is also worth watching, so it can still
+    # hand off when no credit is available.
+    if cfg.get("use_reset_credits"):
+        for name in _credit_windows(cfg):
+            if name not in names:
+                names.append(name)
+    return names
 
 
 def select_window(cfg: dict, rl: dict):
@@ -720,6 +736,12 @@ def cmd_stop(_args) -> int:
         log(f"stop: no rate-limit data for {sid} (rollout={rollout})")
         return 0
 
+    # Reset credits run before the trigger check, because the credit window can
+    # differ from the trigger window. A redeemed credit clears the window, so
+    # there is nothing to hand off.
+    if cfg.get("use_reset_credits") and maybe_redeem_reset_credit(cfg, rl, sid, now):
+        return 0
+
     sel = select_window(cfg, rl)
     if not sel:
         log(f"stop: no usable rate-limit window for {sid} (rollout={rollout})")
@@ -884,6 +906,16 @@ def cmd_status(args) -> int:
         f"thresholds:  stop_percent={cfg.get('stop_percent')} "
         f"weekly={cfg.get('stop_percent_weekly')} trigger={cfg.get('trigger')} resume={cfg.get('resume')}"
     )
+
+    print(
+        f"credits:     use_reset_credits={cfg.get('use_reset_credits')} "
+        f"reset_credit_on={cfg.get('reset_credit_on', 'weekly')}"
+    )
+    if t.get("reset_credit_at"):
+        print(
+            f"             last reset credit: {fmt_reset(t['reset_credit_at'])} "
+            f"({t.get('reset_credit_limit')})"
+        )
     lp = log_path()
     if lp.is_file():
         tail = lp.read_text(encoding="utf-8", errors="ignore").splitlines()[-6:]
@@ -1017,6 +1049,167 @@ def _rpc_request(codex_bin: str, requests: list, timeout: float = 30.0):
                 proc.kill()
 
 
+
+def _rpc_init():
+    """First JSON-RPC request for a codex app-server session."""
+    return {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {
+                "name": "codex-auto-startstop",
+                "title": "codex-auto-startstop",
+                "version": VERSION,
+            },
+            "capabilities": {"experimentalApi": True},
+        },
+    }
+
+
+def _credit_windows(cfg: dict) -> list:
+    """Limit windows whose threshold justifies spending a reset credit."""
+    on = str(cfg.get("reset_credit_on", "weekly")).strip().lower()
+    if on in ("5h", "5-hour", "primary"):
+        return ["5h"]
+    if on in ("both", "auto", "either", "all"):
+        return ["5h", "weekly"]
+    return ["weekly"]
+
+
+def credit_due(cfg: dict, rl: dict):
+    """Return (window_resets_at, label, used) when a reset credit should be spent.
+
+    The window named by `reset_credit_on` must reach its threshold. With
+    "weekly" (the default), a near-limit 5-hour window alone never spends a
+    credit: it hands off instead. A near-limit weekly window always does.
+    """
+    near = []
+    for name in _credit_windows(cfg):
+        key, label, pct_key, default = _LIMIT_DEFS[name]
+        w = rl.get(key) or {}
+        used = w.get("used_percent")
+        if not isinstance(used, (int, float)):
+            continue
+        threshold = float(cfg.get(pct_key, default))
+        if float(used) >= threshold:
+            resets = w.get("resets_at")
+            near.append(
+                (
+                    float(used) - threshold,
+                    resets if isinstance(resets, (int, float)) else None,
+                    label,
+                    float(used),
+                )
+            )
+    if not near:
+        return None
+    near.sort(key=lambda row: row[0], reverse=True)
+    _overshoot, resets, label, used = near[0]
+    return resets, label, used
+
+
+def try_redeem_reset_credit(cfg: dict) -> str:
+    """Redeem one usage-limit reset credit.
+
+    Returns the backend outcome: reset | nothingToReset | noCredit |
+    alreadyRedeemed | unreachable.
+    """
+    requests = [
+        _rpc_init(),
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "account/rateLimitResetCredit/consume",
+            "params": {"idempotencyKey": str(uuid.uuid4())},
+        },
+    ]
+    try:
+        results = _rpc_request(str(cfg.get("codex_bin") or "codex"), requests)
+    except Exception as exc:  # noqa: BLE001 - hooks must never raise
+        log(f"reset-credit: rpc failed: {exc}")
+        return "unreachable"
+    return str((results.get(2) or {}).get("outcome") or "unreachable")
+
+
+def maybe_redeem_reset_credit(cfg: dict, rl: dict, sid: str, now: float) -> bool:
+    """Spend a reset credit when the configured window reaches its threshold.
+
+    Returns True when a credit cleared the window (skip the handoff). Records
+    one attempt per window, so the RPC never repeats for the same window.
+    """
+    due = credit_due(cfg, rl)
+    with state_lock():
+        st = load_state()
+        t = st["threads"].setdefault(sid, {})
+        if not due:
+            # Below every credit threshold: retire markers for a fresh window.
+            changed = t.pop("reset_credit_tried", None) is not None
+            changed = t.pop("reset_credit_for", None) is not None or changed
+            if changed:
+                save_state(st)
+            return False
+        credit_resets, credit_label, credit_used = due
+        key = f"{credit_label}:{credit_resets}"
+        if t.get("reset_credit_for") == key:
+            save_state(st)
+            return True
+        if t.get("reset_credit_tried") == key:
+            save_state(st)
+            return False
+        t["reset_credit_tried"] = key
+        save_state(st)
+
+    outcome = try_redeem_reset_credit(cfg)
+    log(
+        f"stop: reset-credit outcome={outcome} limit={credit_label} "
+        f"used={credit_used:.1f}% window={key}"
+    )
+    if outcome != "reset":
+        if outcome != "unreachable":
+            notify_desktop(
+                cfg,
+                "codex-auto-startstop",
+                f"Reset credit not applied ({outcome}) - writing handoff",
+            )
+        return False
+    with state_lock():
+        st = load_state()
+        t = st["threads"].setdefault(sid, {})
+        t["reset_credit_for"] = key
+        t["reset_credit_at"] = now
+        t["reset_credit_limit"] = credit_label
+        for stale in (
+            "resume_at",
+            "resume_sent_at",
+            "resume_skipped",
+            "resume_failed",
+            "resume_attempts",
+            "sleeper_pid",
+            "sleeper_for",
+            "steered_window",
+            "window_resets_at",
+        ):
+            t.pop(stale, None)
+        save_state(st)
+    notify_desktop(
+        cfg,
+        "codex-auto-startstop",
+        f"Usage limit reset via credit ({credit_label}) - continuing",
+    )
+    return True
+
+
+def fetch_reset_credits(cfg: dict):
+    """Read the account's usage-limit reset credits (app-server RPC)."""
+    requests = [
+        _rpc_init(),
+        {"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read", "params": {}},
+    ]
+    results = _rpc_request(str(cfg.get("codex_bin") or "codex"), requests)
+    return (results.get(2) or {}).get("rateLimitResetCredits")
+
+
 def fetch_hook_hashes(cfg: dict, cwd: str) -> list:
     codex_bin = str(cfg.get("codex_bin") or "codex")
     requests = [
@@ -1040,6 +1233,17 @@ def fetch_hook_hashes(cfg: dict, cwd: str) -> list:
         if isinstance(entry, dict):
             hooks.extend(entry.get("hooks") or [])
     return hooks
+
+
+def cmd_credits(_args) -> int:
+    cfg = load_config()
+    try:
+        summary = fetch_reset_credits(cfg)
+    except Exception as exc:  # noqa: BLE001 - diagnostics only
+        print(json.dumps({"error": str(exc)}))
+        return 1
+    print(json.dumps(summary, indent=2))
+    return 0
 
 
 def cmd_fetch_hashes(args) -> int:
@@ -1207,6 +1411,9 @@ def main(argv=None) -> int:
     p_fh = sub.add_parser("fetch-hashes", help="ask Codex for hook hashes (RPC)")
     p_fh.add_argument("--cwd")
     p_fh.set_defaults(func=cmd_fetch_hashes)
+
+    p_cred = sub.add_parser("credits", help="show available usage-limit reset credits (RPC)")
+    p_cred.set_defaults(func=cmd_credits)
 
     p_inst = sub.add_parser("install", help="install hooks.json + trust")
     p_inst.add_argument("--cwd")

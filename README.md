@@ -4,7 +4,7 @@
 
 **Wrap up before Codex's usage limit. Resume automatically after the reset.**
 
-[![tests](https://img.shields.io/badge/tests-35%20passed-0a0a0a?style=flat-square)](tests/synthetic_test.py)
+[![tests](https://img.shields.io/badge/tests-50%20passed-0a0a0a?style=flat-square)](tests/synthetic_test.py)
 [![python](https://img.shields.io/badge/python-3.10%2B-0a0a0a?style=flat-square)](codex_auto_startstop.py)
 [![license](https://img.shields.io/badge/license-MIT-0a0a0a?style=flat-square)](LICENSE)
 [![codex](https://img.shields.io/badge/codex-%E2%89%A5%200.160-0a0a0a?style=flat-square)](https://github.com/openai/codex)
@@ -26,6 +26,7 @@ Work picks up where it left off. You do not re-derive "where was I" between wind
 | Before the limit | The `Stop` hook reads the usage from the session's own rollout file. At the threshold it blocks the stop and injects one instruction: write `HANDOFF.md`, then stop. |
 | After the reset | A detached sleeper waits for the reset. Then it sends the continue message with `codex queue`, Codex's durable message queue. |
 | After a reboot | The `SessionStart` hook re-arms the sleeper if it died with the machine. |
+| Reset credit (optional) | If a usage-limit reset credit is available, the tool spends it at the threshold and continues. No handoff, no wait. |
 
 The tool is one Python file. It uses the standard library only. It needs no service and no
 network call.
@@ -43,6 +44,38 @@ watches.
 
 Each window has its own threshold: `stop_percent` for 5h, `stop_percent_weekly` for weekly.
 The tool steers once per window. It dedupes on the window reset time.
+
+The tool steers once per window. It dedupes on the window reset time.
+
+## Reset credits (optional)
+
+Codex holds redeemable **usage limit resets** (reset credits). A credit clears the
+eligible windows immediately. Set `use_reset_credits` to `true` to spend a credit at
+the threshold instead of writing a handoff.
+
+`reset_credit_on` selects the window that justifies a credit. The default is `weekly`,
+because waiting for a weekly reset costs days.
+
+With `reset_credit_on: "weekly"`:
+
+| 5h window | weekly window | Action |
+|---|---|---|
+| near limit | far | handoff. No credit. Resume at the 5h reset. |
+| far | near limit | credit. Continue. No handoff. |
+| near limit | near limit | credit. Continue. No handoff. |
+
+With `reset_credit_on: "5h"`, a near-limit 5h window spends a credit. A near-limit
+weekly window alone then hands off. With `reset_credit_on: "both"`, either window spends
+a credit.
+
+When a credit is not available, or the redeem fails, the tool writes the handoff. The
+tool records one attempt per window, so it never spends two credits for the same window.
+
+Restart-free check:
+
+```bash
+python3 ~/.codex/auto-startstop/codex_auto_startstop.py credits
+```
 
 ## Requirements
 
@@ -107,6 +140,8 @@ Edit `~/.codex/auto-startstop/config.json`.
 | Key | Default | Meaning |
 |---|---|---|
 | `trigger` | `"5h"` | Which limit drives the stop and resume: `5h`, `weekly`, or `both`. |
+| `use_reset_credits` | `false` | Spend Codex usage-limit reset credits instead of a handoff. |
+| `reset_credit_on` | `"weekly"` | Window that justifies a credit: `weekly`, `5h`, or `both`. |
 | `stop_percent` | `85.0` | Steer when the 5-hour window reaches this percentage. |
 | `stop_percent_weekly` | `90.0` | Steer when the weekly window reaches this percentage. |
 | `resume_buffer_sec` | `90` | Wait this long after the reset before the continue message. |
@@ -129,6 +164,7 @@ Run Codex as usual. Nothing changes until a window nears its threshold.
 ```bash
 python3 ~/.codex/auto-startstop/codex_auto_startstop.py status            # limits + state
 python3 ~/.codex/auto-startstop/codex_auto_startstop.py status --thread <id>
+python3 ~/.codex/auto-startstop/codex_auto_startstop.py credits           # available reset credits
 tail -f ~/.codex/auto-startstop/auto-startstop.log
 ```
 
@@ -176,8 +212,12 @@ No mocks.
    the trust review, the Stop interception, `HANDOFF.md`, and auto-resume.
 
 `tests/synthetic_test.py` covers the decision logic: the threshold, the per-window dedupe,
-the weekly and `both` triggers, the resume schedule, and the activity check. It runs on
-Python 3.10 to 3.13 on Linux and macOS. See `.github/workflows/ci.yml`.
+the weekly and `both` triggers, the reset-credit decisions, the resume schedule, and the
+activity check. It runs on Python 3.10 to 3.13 on Linux and macOS. See
+`.github/workflows/ci.yml`.
+
+The suite does not spend a real reset credit. It uses a fake app-server. A live redeem
+spends one credit from your account.
 
 ## License
 
