@@ -1,0 +1,19 @@
+{
+  "name": "codex-auto-startstop",
+  "version": "1.0.0",
+  "description": "Automatic handoff before Codex's 5-hour usage limit and automatic resume after the window resets. Ships Stop and SessionStart hooks that steer Codex to write a HANDOFF.md report, then deliver a continue message through codex queue.",
+  "keywords": [
+    "usage-limit",
+    "hooks",
+    "handoff",
+    "resume",
+    "workflow"
+  ],
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "codex-auto-startstop",
+    "shortDescription": "Hand off before the 5h limit, resume after the reset",
+    "developerName": "Ismail Azzouz",
+    "category": "Productivity"
+  }
+}

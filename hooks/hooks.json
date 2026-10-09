@@ -1,0 +1,27 @@
+{
+  "description": "codex-auto-startstop: hand off before the 5h limit, resume after the reset",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/codex_auto_startstop.py\" stop",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/codex_auto_startstop.py\" session-start",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}

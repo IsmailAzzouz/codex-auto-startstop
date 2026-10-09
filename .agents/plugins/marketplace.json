@@ -1,0 +1,20 @@
+{
+  "name": "codex-auto-startstop",
+  "interface": {
+    "displayName": "codex-auto-startstop"
+  },
+  "plugins": [
+    {
+      "name": "codex-auto-startstop",
+      "source": {
+        "source": "local",
+        "path": "."
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
