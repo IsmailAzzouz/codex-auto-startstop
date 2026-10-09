@@ -152,11 +152,26 @@ def log(msg: str) -> None:
         try:
             if p.stat().st_size > 512 * 1024:
                 data = p.read_bytes()[-256 * 1024:]
-                p.write_bytes(data)
+                tmp = p.with_name(p.name + ".trunc")
+                tmp.write_bytes(data)
+                os.replace(tmp, p)
         except OSError:
             pass
     except OSError:
         pass
+
+
+def _atomic_write_text(path: Path, text: str, mode: int | None = None) -> None:
+    """Durably replace `path` with `text` (temp file + fsync + rename)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
+    os.replace(tmp, path)
 
 
 def load_config() -> dict:
@@ -300,11 +315,7 @@ def load_state() -> dict:
 
 
 def save_state(st: dict) -> None:
-    p = state_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(st, indent=1, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, p)
+    _atomic_write_text(state_path(), json.dumps(st, indent=1, sort_keys=True), mode=0o600)
 
 
 # --------------------------------------------------------------------------- rollout parsing
@@ -435,7 +446,13 @@ def find_rollout(session_id: str, hint=None) -> Path | None:
         except OSError:
             matches = []
         if matches:
-            matches.sort(key=lambda m: os.path.getmtime(m), reverse=True)
+            def _mtime(m):
+                try:
+                    return os.path.getmtime(m)
+                except OSError:
+                    return 0.0
+
+            matches.sort(key=_mtime, reverse=True)
             return Path(matches[0])
     return None
 
@@ -520,58 +537,52 @@ def _pid_alive(pid) -> bool:
 
 def ensure_sleeper(session_id: str) -> bool:
     """Spawn the detached resume helper unless one is already running."""
+    # Hold the lock across the check-and-spawn so two concurrent hooks cannot
+    # both observe "no live sleeper" and spawn two helpers.
+    with state_lock():
+        st = load_state()
+        t = st["threads"].setdefault(session_id, {})
+        if not t.get("resume_at"):
+            return False
+        if t.get("resume_sent_at") or t.get("resume_skipped") or t.get("resume_failed"):
+            return False
+        if os.environ.get("CODEX_AUTO_STARTSTOP_NO_SPAWN"):
+            log(f"sleeper: spawn suppressed (NO_SPAWN) for {session_id}")
+            return False
+        pid = t.get("sleeper_pid")
+        if pid and t.get("sleeper_for") == t.get("resume_at") and _pid_alive(pid):
+            return True
 
-    def _state_mutate(fn):
-        with state_lock():
-            st = load_state()
-            t = st["threads"].setdefault(session_id, {})
-            result = fn(t)
-            save_state(st)
-            return result
+        script = Path(__file__).resolve()
+        cfg = load_config()
+        python = str(cfg.get("python") or sys.executable or "python3")
+        detach: dict = {}
+        if os.name == "posix":
+            detach["start_new_session"] = True
+        else:  # Windows: closest equivalent of setsid + no console window
+            detach["creationflags"] = 0x00000008 | 0x00000200
+        try:
+            logf = open(log_path(), "a", encoding="utf-8")
+            try:
+                proc = subprocess.Popen(
+                    [python, str(script), "sleeper", "--thread", session_id],
+                    stdin=subprocess.DEVNULL,
+                    stdout=logf,
+                    stderr=logf,
+                    cwd=str(auto_startstop_home()),
+                    **detach,
+                )
+            finally:
+                logf.close()
+        except OSError as exc:
+            log(f"sleeper: spawn failed for {session_id}: {exc}")
+            return False
 
-    t = _state_mutate(lambda t: dict(t))
-    if not t.get("resume_at"):
-        return False
-    if t.get("resume_sent_at") or t.get("resume_skipped") or t.get("resume_failed"):
-        return False
-    if os.environ.get("CODEX_AUTO_STARTSTOP_NO_SPAWN"):
-        log(f"sleeper: spawn suppressed (NO_SPAWN) for {session_id}")
-        return False
-    pid = t.get("sleeper_pid")
-    if pid and t.get("sleeper_for") == t.get("resume_at") and _pid_alive(pid):
-        return True
-
-    script = Path(__file__).resolve()
-    cfg = load_config()
-    python = str(cfg.get("python") or sys.executable or "python3")
-    logf = open(log_path(), "a", encoding="utf-8")
-    detach: dict = {}
-    if os.name == "posix":
-        detach["start_new_session"] = True
-    else:  # Windows: closest equivalent of setsid + no console window
-        detach["creationflags"] = 0x00000008 | 0x00000200
-    try:
-        proc = subprocess.Popen(
-            [python, str(script), "sleeper", "--thread", session_id],
-            stdin=subprocess.DEVNULL,
-            stdout=logf,
-            stderr=logf,
-            cwd=str(auto_startstop_home()),
-            **detach,
-        )
-    except OSError as exc:
-        log(f"sleeper: spawn failed for {session_id}: {exc}")
-        return False
-    finally:
-        logf.close()
-
-    def _record(t):
         t["sleeper_pid"] = proc.pid
         t["sleeper_for"] = t.get("resume_at")
-
-    _state_mutate(_record)
-    log(f"sleeper: spawned pid={proc.pid} for {session_id} (resume_at={t.get('resume_at')})")
-    return True
+        save_state(st)
+        log(f"sleeper: spawned pid={proc.pid} for {session_id} (resume_at={t.get('resume_at')})")
+        return True
 
 
 def cmd_sleeper(args) -> int:
@@ -581,6 +592,9 @@ def cmd_sleeper(args) -> int:
     deadline = time.time() + (args.max_hours * 3600 if args.max_hours else 8 * 3600)
     log(f"sleeper: start for {sid} (once={args.once})")
     while True:
+        if time.time() > deadline:
+            log(f"sleeper: max lifetime reached for {sid}; exit")
+            return 0
         with state_lock():
             st = load_state()
             t = dict(st["threads"].get(sid) or {})
@@ -629,9 +643,6 @@ def cmd_sleeper(args) -> int:
                     tt["sleeper_for"] = tt["resume_at"]
                     save_state(st)
                 log(f"sleeper: {sel['label']} still exhausted for {sid}; new resume_at={tt['resume_at']}")
-                if args.once:
-                    return 0
-                continue
                 if args.once:
                     return 0
                 continue
@@ -996,10 +1007,9 @@ def _seed_trust(toml_path: Path, key: str, trusted_hash: str) -> bool:
     new_text = (body + "\n\n" if body else "") + block + "\n"
     if new_text == text:
         return False
-    toml_path.parent.mkdir(parents=True, exist_ok=True)
     if toml_path.is_file():
         shutil.copy2(toml_path, toml_path.with_suffix(".toml.auto-startstop.bak"))
-    toml_path.write_text(new_text, encoding="utf-8")
+    _atomic_write_text(toml_path, new_text)
     return True
 
 
@@ -1288,7 +1298,7 @@ def cmd_install(args) -> int:
 
     # 2. default config
     if not config_path().exists():
-        config_path().write_text(json.dumps(DEFAULT_CONFIG, indent=2), encoding="utf-8")
+        _atomic_write_text(config_path(), json.dumps(DEFAULT_CONFIG, indent=2))
         print(f"wrote default config      {config_path()}")
     else:
         print(f"kept existing config      {config_path()}")
@@ -1310,7 +1320,7 @@ def cmd_install(args) -> int:
     ss_cmd = _hooks_json_command(cfg, "session-start")
     changed = _merge_hook_entry(data, "Stop", stop_cmd)
     changed = _merge_hook_entry(data, "SessionStart", ss_cmd) or changed
-    hj.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    _atomic_write_text(hj, json.dumps(data, indent=2) + "\n")
     print(f"hooks {'updated' if changed else 'ok'}          {hj}")
     print(f"  Stop         -> {stop_cmd}")
     print(f"  SessionStart -> {ss_cmd}")
@@ -1368,7 +1378,7 @@ def cmd_uninstall(args) -> int:
             changed = _remove_hook_entry(data, _hooks_json_command(cfg, "session-start")) or changed
             if changed:
                 shutil.copy2(hj, hj.with_suffix(".json.auto-startstop.bak"))
-                hj.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+                _atomic_write_text(hj, json.dumps(data, indent=2) + "\n")
                 print(f"removed auto-startstop hooks from {hj}")
             else:
                 print(f"no auto-startstop hooks found in {hj}")
