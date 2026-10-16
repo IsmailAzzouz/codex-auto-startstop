@@ -141,37 +141,70 @@ def hooks_path() -> Path:
 # --------------------------------------------------------------------------- handoff prompt
 
 
-def handoff_prompt_path() -> Path | None:
-    """Standalone markdown file that holds the handoff prompt, if one exists.
+# The handoff prompt lives in its own markdown file so it can be reworded without
+# touching this script or config.json. Anything unusable - missing, empty,
+# whitespace-only, oversized, unreadable or not valid UTF-8 - falls back to the
+# built-in default, so the Stop hook can never break on the prompt file.
+MAX_HANDOFF_PROMPT_BYTES = 64 * 1024
 
-    The handoff prompt lives in its own markdown file so it can be reworded
-    without touching this script or config.json. Looked up in order: the
-    auto-startstop home (seeded by `install`), then `prompts/handoff.md`
-    next to this script.
+
+def _script_prompt_file() -> Path | None:
+    """Shipped default prompt next to this script, or None if it cannot be located."""
+    try:
+        return Path(__file__).resolve().parent / "prompts" / "handoff.md"
+    except (OSError, RuntimeError):
+        # e.g. a symlink loop: treat it as "no shipped prompt" instead of raising.
+        return None
+
+
+def handoff_prompt_candidates() -> list:
+    """Prompt file locations, most specific first (installed copy, then shipped)."""
+    candidates = [auto_startstop_home() / "handoff-prompt.md"]
+    script_prompt = _script_prompt_file()
+    if script_prompt is not None:
+        candidates.append(script_prompt)
+    return candidates
+
+
+def read_handoff_prompt(path: Path | None) -> str | None:
+    """Trimmed prompt text from `path`, or None when that file is unusable.
+
+    Never raises. The file is read inside a `with` block, so the handle is
+    closed even when the read fails, and every failure mode - missing, not a
+    regular file, unreadable, oversized, not valid UTF-8, empty or
+    whitespace-only - degrades to None so the caller can fall back to the
+    built-in prompt. A UTF-8 BOM left by an editor is dropped and CRLF line
+    endings are normalised.
     """
-    candidates = (
-        auto_startstop_home() / "handoff-prompt.md",
-        Path(__file__).resolve().parent / "prompts" / "handoff.md",
-    )
-    for candidate in candidates:
-        try:
-            if candidate.is_file() and candidate.read_text(encoding="utf-8").strip():
-                return candidate
-        except OSError:
-            continue
-    return None
+    if path is None:
+        return None
+    try:
+        if not path.is_file():
+            return None
+        size = path.stat().st_size
+        if size > MAX_HANDOFF_PROMPT_BYTES:
+            log(f"handoff prompt: ignoring {path} ({size} bytes > {MAX_HANDOFF_PROMPT_BYTES})")
+            return None
+        # utf-8-sig also strips the BOM a Windows editor may leave behind.
+        with open(path, encoding="utf-8-sig") as fh:
+            text = fh.read(MAX_HANDOFF_PROMPT_BYTES)
+    except OSError as exc:
+        log(f"handoff prompt: cannot read {path}: {exc}")
+        return None
+    except UnicodeDecodeError as exc:
+        log(f"handoff prompt: {path} is not valid UTF-8: {exc}")
+        return None
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return text or None
 
 
 def load_handoff_prompt() -> str | None:
-    """Handoff prompt text from its markdown file, or None for the built-in."""
-    path = handoff_prompt_path()
-    if not path:
-        return None
-    try:
-        return path.read_text(encoding="utf-8").strip()
-    except OSError:
-        log(f"handoff prompt: unreadable {path}")
-        return None
+    """First usable handoff prompt file, or None to use the built-in prompt."""
+    for candidate in handoff_prompt_candidates():
+        text = read_handoff_prompt(candidate)
+        if text:
+            return text
+    return None
 
 
 # --------------------------------------------------------------------------- basic io
@@ -247,9 +280,35 @@ class _SafeDict(dict):
         return "{" + key + "}"
 
 
+_FIELD_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*[^{}]*\}")
+
+
+def _escape_stray_braces(template: str) -> str:
+    """Escape braces that are not part of a `{placeholder}` field.
+
+    Hand-edited prompt files often contain literal braces (JSON or code
+    samples). Without this, one stray `{` makes format_map fail and the whole
+    prompt comes back with every placeholder unrendered.
+    """
+    parts = []
+    pos = 0
+    for match in _FIELD_RE.finditer(template):
+        parts.append(template[pos : match.start()].replace("{", "{{").replace("}", "}}"))
+        parts.append(match.group(0))
+        pos = match.end()
+    parts.append(template[pos:].replace("{", "{{").replace("}", "}}"))
+    return "".join(parts)
+
+
 def render(template: str, **ctx) -> str:
     try:
         return str(template).format_map(_SafeDict(ctx))
+    except (ValueError, IndexError, KeyError):
+        pass
+    # Retry with stray braces escaped, so a malformed template still fills in
+    # the placeholders it does declare instead of leaking them verbatim.
+    try:
+        return _escape_stray_braces(str(template)).format_map(_SafeDict(ctx))
     except (ValueError, IndexError, KeyError):
         return str(template)
 
@@ -1351,12 +1410,8 @@ def cmd_install(args) -> int:
     # 2b. handoff prompt (standalone markdown, easy to edit)
     prompt_dst = ah / "handoff-prompt.md"
     if not prompt_dst.exists():
-        prompt_src = Path(__file__).resolve().parent / "prompts" / "handoff.md"
-        try:
-            text = prompt_src.read_text(encoding="utf-8") if prompt_src.is_file() else None
-        except OSError:
-            text = None
-        _atomic_write_text(prompt_dst, text or DEFAULT_CONFIG["stop_message"].rstrip() + "\n")
+        text = read_handoff_prompt(_script_prompt_file())
+        _atomic_write_text(prompt_dst, (text or DEFAULT_CONFIG["stop_message"].rstrip()) + "\n")
         print(f"wrote handoff prompt      {prompt_dst}")
     else:
         print(f"kept existing handoff prompt   {prompt_dst}")

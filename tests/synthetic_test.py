@@ -534,6 +534,90 @@ def test_config_stop_message_overrides_file(tmp: Path) -> None:
     check("legacy JSON override wins", reason.startswith("JSON PROMPT"), reason[:120])
 
 
+def test_handoff_prompt_file_edges(tmp: Path) -> None:
+    print("test: unusable prompt files fall back to a usable prompt")
+    cases = {
+        "empty": b"",
+        "whitespace": b"   \n\n\t",
+        "binary": b"\xff\xfe\x00 not utf-8 \x80",
+        "oversize": b"x" * (64 * 1024 + 1),
+    }
+    for name, raw in cases.items():
+        case = tmp / name
+        case.mkdir()
+        home, sessions, env, _ = make_sandbox(case)
+        prompt = home / "auto-startstop" / "handoff-prompt.md"
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_bytes(raw)
+        write_rollout(sessions, used=92.0, resets_at=time.time() + 3600)
+        proc = run_cli(["stop"], env, hook_input())
+        out = _json(proc.stdout)
+        reason = out.get("reason", "")
+        check(f"{name}: exit 0", proc.returncode == 0, proc.stderr[-160:])
+        check(f"{name}: still blocks", out.get("decision") == "block", proc.stdout[:160])
+        check(
+            f"{name}: usable fallback prompt",
+            "HANDOFF.md" in reason and "NEXT" in reason,
+            reason[:120],
+        )
+
+
+def test_handoff_prompt_bom_stripped(tmp: Path) -> None:
+    print("test: a UTF-8 BOM on the prompt file is stripped")
+    home, sessions, env, _ = make_sandbox(tmp)
+    prompt = home / "auto-startstop" / "handoff-prompt.md"
+    prompt.parent.mkdir(parents=True, exist_ok=True)
+    prompt.write_bytes("BOM PROMPT for {handoff_file}".encode("utf-8-sig"))
+    write_rollout(sessions, used=92.0, resets_at=time.time() + 3600)
+    reason = _json(run_cli(["stop"], env, hook_input()).stdout).get("reason", "")
+    check("prompt used", reason.startswith("BOM PROMPT"), repr(reason[:24]))
+    check("BOM dropped", "\ufeff" not in reason, repr(reason[:24]))
+
+
+def test_handoff_prompt_stray_braces(tmp: Path) -> None:
+    print("test: literal braces in the prompt still render placeholders")
+    home, sessions, env, _ = make_sandbox(tmp)
+    prompt = home / "auto-startstop" / "handoff-prompt.md"
+    prompt.parent.mkdir(parents=True, exist_ok=True)
+    prompt.write_text('json {"a": 1} -> write {handoff_file} ({percent:.0f}%)', encoding="utf-8")
+    write_rollout(sessions, used=92.0, resets_at=time.time() + 3600)
+    reason = _json(run_cli(["stop"], env, hook_input()).stdout).get("reason", "")
+    check("literal brace kept", '{"a": 1}' in reason, reason[:120])
+    check("placeholder rendered", "write HANDOFF.md (92%)" in reason, reason[:120])
+
+
+def test_builtin_prompt_when_no_file(tmp: Path) -> None:
+    print("test: no prompt file anywhere -> built-in default is used")
+    _home, _sessions, env, _ = make_sandbox(tmp)
+    lone = tmp / "lone"
+    lone.mkdir()
+    script = lone / "codex_auto_startstop.py"
+    script.write_text(SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+    env = dict(env)
+    env["CODEX_AUTO_STARTSTOP_HOME"] = str(tmp / "lone-home")
+    code = (
+        "import gc, importlib.util, json, sys\n"
+        "spec = importlib.util.spec_from_file_location('cas', sys.argv[1])\n"
+        "m = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(m)\n"
+        "cfg = m.load_config()\n"
+        "found = m.load_handoff_prompt()\n"
+        "gc.collect()\n"
+        "print(json.dumps({'builtin': cfg['stop_message'] == m.DEFAULT_CONFIG['stop_message'],\n"
+        "                  'found': found}))\n"
+    )
+    proc = subprocess.run(
+        [PY, "-W", "error::ResourceWarning", "-c", code, str(script)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    data = _json(proc.stdout.strip().splitlines()[-1]) if proc.stdout.strip() else {}
+    check("no prompt file found", data.get("found") is None, (str(data) + proc.stderr)[:200])
+    check("built-in prompt used", data.get("builtin") is True, str(data)[:200])
+
+
 def main() -> int:
     tests = [
         test_below_threshold,
@@ -556,6 +640,10 @@ def main() -> int:
         test_credit_once_per_window,
         test_handoff_prompt_file,
         test_config_stop_message_overrides_file,
+        test_handoff_prompt_file_edges,
+        test_handoff_prompt_bom_stripped,
+        test_handoff_prompt_stray_braces,
+        test_builtin_prompt_when_no_file,
     ]
     for fn in tests:
         with tempfile.TemporaryDirectory(prefix="auto-startstop-test-") as td:
