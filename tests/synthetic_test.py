@@ -504,6 +504,36 @@ def test_credit_once_per_window(tmp: Path) -> None:
     check("second run: no output", proc.stdout.strip() == "", proc.stdout[:200])
     check("credit redeemed exactly once", len(_credit_calls(fake_log)) == 1, str(_credit_calls(fake_log)))
 
+def test_handoff_prompt_file(tmp: Path) -> None:
+    print("test: handoff-prompt.md supplies the handoff prompt")
+    home, sessions, env, _ = make_sandbox(tmp)
+    d = home / "auto-startstop"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "handoff-prompt.md").write_text(
+        "CUSTOM PROMPT {percent:.0f}% -> write {handoff_file} now (NEXT)", encoding="utf-8"
+    )
+    write_rollout(sessions, used=92.0, resets_at=time.time() + 3600)
+    proc = run_cli(["stop"], env, hook_input())
+    out = _json(proc.stdout)
+    reason = out.get("reason", "")
+    check("decision=block", out.get("decision") == "block", proc.stdout[:200])
+    check("prompt read from file", reason.startswith("CUSTOM PROMPT"), reason[:120])
+    check("placeholders rendered", "92% -> write HANDOFF.md now" in reason, reason[:120])
+
+
+def test_config_stop_message_overrides_file(tmp: Path) -> None:
+    print("test: stop_message in config.json beats the prompt file")
+    home, sessions, env, _ = make_sandbox(tmp)
+    write_config(home, stop_message="JSON PROMPT for {handoff_file}")
+    (home / "auto-startstop" / "handoff-prompt.md").write_text("FILE PROMPT", encoding="utf-8")
+    write_rollout(sessions, used=92.0, resets_at=time.time() + 3600)
+    proc = run_cli(["stop"], env, hook_input())
+    out = _json(proc.stdout)
+    reason = out.get("reason", "")
+    check("decision=block", out.get("decision") == "block", proc.stdout[:200])
+    check("legacy JSON override wins", reason.startswith("JSON PROMPT"), reason[:120])
+
+
 def main() -> int:
     tests = [
         test_below_threshold,
@@ -524,6 +554,8 @@ def main() -> int:
         test_credit_unavailable_falls_back,
         test_credit_on_5h,
         test_credit_once_per_window,
+        test_handoff_prompt_file,
+        test_config_stop_message_overrides_file,
     ]
     for fn in tests:
         with tempfile.TemporaryDirectory(prefix="auto-startstop-test-") as td:

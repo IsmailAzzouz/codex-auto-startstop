@@ -43,7 +43,7 @@ git clone https://github.com/IsmailAzzouz/codex-auto-startstop.git
 python3 codex-auto-startstop/codex_auto_startstop.py install
 ```
 
-The installer copies the script to `~/.codex/auto-startstop/`, creates a default configuration, and registers the hooks in `~/.codex/hooks.json`. Review and approve the hooks if Codex requests it.
+The installer copies the script to `~/.codex/auto-startstop/`, creates a default configuration, seeds the editable handoff prompt (see [Handoff prompt](#handoff-prompt)), and registers the hooks in `~/.codex/hooks.json`. Review and approve the hooks if Codex requests it.
 
 ## Configuration
 
@@ -72,6 +72,15 @@ For example, to monitor both usage windows, set:
 ```
 
 The tool checks thresholds at turn boundaries, so a handoff is not guaranteed before an active turn exhausts the available usage.
+
+### Handoff prompt
+
+The prompt that asks Codex to wrap up lives in its own markdown file, so you can reword it without touching the script or the JSON config:
+
+- Plugin installs read `prompts/handoff.md` from the plugin folder.
+- Standalone installs seed `~/.codex/auto-startstop/handoff-prompt.md` on first install; edit that copy.
+
+At send time the `Stop` hook fills in `{window}`, `{percent}`, `{minutes_left}`, `{reset_local}`, `{handoff_file}`, and `{handoff_path}`. Keep `{handoff_file}` so Codex knows which file to write. For compatibility, a `stop_message` value in `config.json` still overrides the file.
 
 ### Optional reset credits
 

@@ -138,6 +138,42 @@ def hooks_path() -> Path:
     return codex_home() / "hooks.json"
 
 
+# --------------------------------------------------------------------------- handoff prompt
+
+
+def handoff_prompt_path() -> Path | None:
+    """Standalone markdown file that holds the handoff prompt, if one exists.
+
+    The handoff prompt lives in its own markdown file so it can be reworded
+    without touching this script or config.json. Looked up in order: the
+    auto-startstop home (seeded by `install`), then `prompts/handoff.md`
+    next to this script.
+    """
+    candidates = (
+        auto_startstop_home() / "handoff-prompt.md",
+        Path(__file__).resolve().parent / "prompts" / "handoff.md",
+    )
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and candidate.read_text(encoding="utf-8").strip():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def load_handoff_prompt() -> str | None:
+    """Handoff prompt text from its markdown file, or None for the built-in."""
+    path = handoff_prompt_path()
+    if not path:
+        return None
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        log(f"handoff prompt: unreadable {path}")
+        return None
+
+
 # --------------------------------------------------------------------------- basic io
 
 
@@ -176,13 +212,21 @@ def _atomic_write_text(path: Path, text: str, mode: int | None = None) -> None:
 
 def load_config() -> dict:
     cfg = dict(DEFAULT_CONFIG)
+    user: dict = {}
     try:
         if config_path().is_file():
-            user = json.loads(config_path().read_text(encoding="utf-8"))
-            if isinstance(user, dict):
+            loaded = json.loads(config_path().read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                user = loaded
                 cfg.update(user)
     except (OSError, json.JSONDecodeError) as exc:
         log(f"config: ignoring unreadable config.json: {exc}")
+    # The handoff prompt is a standalone markdown file (easy to edit). An
+    # explicit "stop_message" in config.json still wins, for compatibility.
+    if "stop_message" not in user:
+        prompt = load_handoff_prompt()
+        if prompt:
+            cfg["stop_message"] = prompt
     env_map = {
         "CODEX_AUTO_STARTSTOP_STOP_PERCENT": ("stop_percent", float),
         "CODEX_AUTO_STARTSTOP_RESUME_BUFFER_SEC": ("resume_buffer_sec", float),
@@ -1296,12 +1340,26 @@ def cmd_install(args) -> int:
         shutil.copy2(src, dst)
     dst.chmod(0o755)
 
-    # 2. default config
+    # 2. default config (the handoff prompt is seeded as a markdown file instead)
     if not config_path().exists():
-        _atomic_write_text(config_path(), json.dumps(DEFAULT_CONFIG, indent=2))
+        seed = {k: v for k, v in DEFAULT_CONFIG.items() if k != "stop_message"}
+        _atomic_write_text(config_path(), json.dumps(seed, indent=2))
         print(f"wrote default config      {config_path()}")
     else:
         print(f"kept existing config      {config_path()}")
+
+    # 2b. handoff prompt (standalone markdown, easy to edit)
+    prompt_dst = ah / "handoff-prompt.md"
+    if not prompt_dst.exists():
+        prompt_src = Path(__file__).resolve().parent / "prompts" / "handoff.md"
+        try:
+            text = prompt_src.read_text(encoding="utf-8") if prompt_src.is_file() else None
+        except OSError:
+            text = None
+        _atomic_write_text(prompt_dst, text or DEFAULT_CONFIG["stop_message"].rstrip() + "\n")
+        print(f"wrote handoff prompt      {prompt_dst}")
+    else:
+        print(f"kept existing handoff prompt   {prompt_dst}")
 
     # 3. hooks.json
     hj = hooks_path()
