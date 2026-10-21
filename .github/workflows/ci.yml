@@ -27,6 +27,8 @@ jobs:
         run: python3 scripts/release_version.py check
       - name: Test automatic release logic
         run: python3 tests/release_test.py
+      - name: Simulate release publication and reruns (offline Git/GitHub)
+        run: python3 tests/release_integration_test.py
       - name: Run synthetic hooks tests
         run: python3 tests/synthetic_test.py
 
