@@ -618,8 +618,97 @@ def test_builtin_prompt_when_no_file(tmp: Path) -> None:
     check("built-in prompt used", data.get("builtin") is True, str(data)[:200])
 
 
+def test_install_requires_hook_approval(tmp: Path) -> None:
+    print("test: install never trusts hooks and preserves unrelated hook definitions")
+    home, _sessions, env, _ = make_sandbox(tmp)
+    home.mkdir(parents=True, exist_ok=True)
+    env = dict(env)
+    env["CODEX_HOME"] = str(home)
+    toml = home / "config.toml"
+    original_toml = '[features]\ncodex_hooks = true\n'
+    toml.write_text(original_toml, encoding="utf-8")
+    hj = home / "hooks.json"
+    foreign = {"type": "command", "command": "echo unrelated", "timeout": 5}
+    hj.write_text(json.dumps({"description": "user hooks", "hooks": {
+        "Stop": [{"hooks": [foreign]}]}}), encoding="utf-8")
+    first = run_cli(["install"], env)
+    check("install exits 0", first.returncode == 0, first.stderr[-200:])
+    check("installer says NOT trusted", "NOT trusted" in first.stdout, first.stdout[:200])
+    check("config.toml untouched", toml.read_text(encoding="utf-8") == original_toml)
+    data = json.loads(hj.read_text(encoding="utf-8"))
+    check("existing Stop hook preserved", any(
+        foreign in group["hooks"] for group in data["hooks"]["Stop"]))
+    for event in ("Stop", "SessionStart"):
+        ours = [h for g in data["hooks"][event] for h in g["hooks"]
+                if "codex_auto_startstop.py" in h.get("command", "")]
+        check(f"{event}: exactly one command", len(ours) == 1)
+        check(f"{event}: clear status", bool(ours and ours[0].get(
+            "statusMessage", "").startswith("codex-auto-startstop:")))
+    initial = hj.read_bytes()
+    initial_mtime = hj.stat().st_mtime_ns
+    second = run_cli(["install"], env)
+    check("reinstall exits 0", second.returncode == 0)
+    check("reinstall reports unchanged", "hooks unchanged" in second.stdout)
+    check("reinstall preserves hook contents", hj.read_bytes() == initial)
+    check("reinstall does not rewrite hook file", hj.stat().st_mtime_ns == initial_mtime)
+    check("reinstall does not trust hooks", toml.read_text(encoding="utf-8") == original_toml)
+
+    # Uninstall recognizes older commands even if config's Python setting changed.
+    write_config(home, python="/opt/other-python")
+    removed = run_cli(["uninstall"], env)
+    check("uninstall exits 0", removed.returncode == 0, removed.stderr[-200:])
+    remaining = json.loads(hj.read_text(encoding="utf-8"))
+    check("uninstall preserves unrelated hook", any(
+        foreign in group["hooks"] for group in remaining["hooks"]["Stop"]))
+    check("uninstall removes Stop handler", not any(
+        "codex_auto_startstop.py" in h.get("command", "")
+        for g in remaining["hooks"]["Stop"] for h in g["hooks"]))
+    check("uninstall removes SessionStart handler",
+          "SessionStart" not in remaining["hooks"])
+
+
+def test_install_refuses_broken_hooks(tmp: Path) -> None:
+    print("test: malformed hooks fail safely without copying or overwriting")
+    home, _sessions, env, _ = make_sandbox(tmp)
+    home.mkdir(parents=True, exist_ok=True)
+    env = dict(env)
+    env["CODEX_HOME"] = str(home)
+    hj = home / "hooks.json"
+    for malformed in ('[]', '{"hooks": {"Stop": "bad"}}', '{"hooks":'):
+        hj.write_text(malformed, encoding="utf-8")
+        proc = run_cli(["install"], env)
+        check("invalid hook config rejected", proc.returncode == 1)
+        check("invalid hook config unchanged", hj.read_text(encoding="utf-8") == malformed)
+        check("no script copied on invalid config",
+              not (home / "auto-startstop" / "codex_auto_startstop.py").exists())
+
+
+def test_reinstall_consolidates_old_hooks(tmp: Path) -> None:
+    print("test: stale standalone commands are replaced without duplicates")
+    home, _sessions, env, _ = make_sandbox(tmp)
+    home.mkdir(parents=True, exist_ok=True)
+    env = dict(env)
+    env["CODEX_HOME"] = str(home)
+    command = "python3 /older/codex-auto-startstop/codex_auto_startstop.py stop"
+    hj = home / "hooks.json"
+    hj.write_text(json.dumps({"hooks": {"Stop": [
+        {"hooks": [{"type": "command", "command": command}]},
+        {"hooks": [{"type": "command", "command": command}]},
+    ]}}), encoding="utf-8")
+    installed = run_cli(["install"], env)
+    check("upgrade installs", installed.returncode == 0, installed.stderr[-200:])
+    data = json.loads(hj.read_text(encoding="utf-8"))
+    commands = [h["command"] for group in data["hooks"]["Stop"]
+                for h in group["hooks"]]
+    check("no duplicate Stop hooks", len(commands) == 1, str(commands))
+    check("old script path replaced", "/older/" not in commands[0], str(commands))
+
+
 def main() -> int:
     tests = [
+        test_install_requires_hook_approval,
+        test_install_refuses_broken_hooks,
+        test_reinstall_consolidates_old_hooks,
         test_below_threshold,
         test_steer,
         test_dedupe_and_new_window,
