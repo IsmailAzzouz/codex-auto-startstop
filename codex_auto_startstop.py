@@ -34,8 +34,8 @@ Subcommands (used by Codex hooks / install / humans):
   sleeper         background helper (detached); one-shot with --once
   status          show rate-limit + auto-startstop state for a session
   credits         show available usage-limit reset credits (app-server RPC)
-  install         install hooks.json + seed hook trust; copy this script into CODEX_HOME
-  uninstall       remove hooks and trust entries
+  install         register hooks for explicit Codex approval; copy script into CODEX_HOME
+  uninstall       remove standalone hook commands
   fetch-hashes    internal: ask Codex for current hook hashes (app-server RPC)
 
 Env overrides (mostly for tests):
@@ -69,7 +69,7 @@ try:  # POSIX only; hook state locking degrades to a no-op elsewhere
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 DEFAULT_CONFIG = {
     "trigger": "5h",
@@ -692,10 +692,11 @@ def cmd_sleeper(args) -> int:
     cfg = load_config()
     sid = args.thread
     poll = float(os.environ.get("CODEX_AUTO_STARTSTOP_POLL_SEC", cfg.get("poll_sec", 30)) or 30)
-    deadline = time.time() + (args.max_hours * 3600 if args.max_hours else 8 * 3600)
+    # Weekly limits can reset several days later; the default must not expire at 8h.
+    deadline = time.time() + args.max_hours * 3600 if args.max_hours else None
     log(f"sleeper: start for {sid} (once={args.once})")
     while True:
-        if time.time() > deadline:
+        if deadline is not None and time.time() > deadline:
             log(f"sleeper: max lifetime reached for {sid}; exit")
             return 0
         with state_lock():
@@ -1052,68 +1053,97 @@ def _hooks_json_command(cfg: dict, subcommand: str) -> str:
     return f"{shlex.quote(python)} {shlex.quote(str(script))} {subcommand}"
 
 
+_HOOK_STATUS = {
+    "Stop": "codex-auto-startstop: check usage and prepare a handoff",
+    "SessionStart": "codex-auto-startstop: re-arm a pending continuation",
+}
+
+
+def _is_our_hook_command(command: object, subcommand: str) -> bool:
+    """Recognize older standalone commands if their interpreter/path changed."""
+    if not isinstance(command, str):
+        return False
+    try:
+        parts = shlex.split(command, posix=os.name != "nt")
+    except ValueError:
+        return False
+    if len(parts) < 2 or parts[-1].strip('"') != subcommand:
+        return False
+    return any(
+        part.strip('"').replace("\\", "/").endswith("/codex_auto_startstop.py")
+        for part in parts[:-1]
+    )
+
+
 def _merge_hook_entry(data: dict, event: str, command: str) -> bool:
-    """Add/refresh our command entry under hooks.<event>. Returns True if changed."""
+    """Keep one standalone handler per event and preserve unrelated hooks."""
     hooks = data.setdefault("hooks", {})
     groups = hooks.setdefault(event, [])
-    for group in groups:
-        for handler in group.get("hooks", []):
-            if handler.get("type") == "command" and handler.get("command") == command:
-                handler["timeout"] = 60
-                return False
-    groups.append({"hooks": [{"type": "command", "command": command, "timeout": 60}]})
-    return True
-
-
-def _remove_hook_entry(data: dict, command: str) -> bool:
+    desired = {
+        "type": "command",
+        "command": command,
+        "timeout": 60,
+        "statusMessage": _HOOK_STATUS[event],
+    }
+    found = False
     changed = False
-    hooks = data.get("hooks") or {}
-    for event, groups in list(hooks.items()):
-        new_groups = []
-        for group in groups:
-            handlers = [h for h in group.get("hooks", []) if h.get("command") != command]
-            if len(handlers) != len(group.get("hooks", [])):
-                changed = True
-            if handlers:
-                group["hooks"] = handlers
-                new_groups.append(group)
-            elif group.get("hooks"):
-                changed = True
-        if new_groups:
-            hooks[event] = new_groups
-        else:
-            del hooks[event]
+    retained = []
+    subcommand = "stop" if event == "Stop" else "session-start"
+    for group in groups:
+        updated = []
+        for handler in group["hooks"]:
+            if handler.get("type") == "command" and _is_our_hook_command(
+                handler.get("command"), subcommand
+            ):
+                if found:
+                    changed = True
+                    continue
+                found = True
+                if handler != desired:
+                    changed = True
+                updated.append(desired)
+            else:
+                updated.append(handler)
+        if updated:
+            if updated != group["hooks"]:
+                group["hooks"] = updated
+            retained.append(group)
+        elif group["hooks"]:
+            changed = True
+    if not found:
+        retained.append({"hooks": [desired]})
+        changed = True
+    hooks[event] = retained
     return changed
 
 
-def _toml_quote(s: str) -> str:
-    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def _seed_trust(toml_path: Path, key: str, trusted_hash: str) -> bool:
-    text = toml_path.read_text(encoding="utf-8") if toml_path.is_file() else ""
-    header = f"[hooks.state.{_toml_quote(key)}]"
-    lines = text.splitlines()
-    out = []
-    skipping = False
-    for line in lines:
-        stripped = line.strip()
-        is_header = stripped.startswith("[") and stripped.endswith("]")
-        if is_header:
-            skipping = stripped == header
-            if skipping:
-                continue
-        if not skipping:
-            out.append(line)
-    body = "\n".join(out).rstrip("\n")
-    block = f"{header}\ntrusted_hash = {_toml_quote(trusted_hash)}"
-    new_text = (body + "\n\n" if body else "") + block + "\n"
-    if new_text == text:
+def _remove_hook_entry(data: dict, event: str) -> bool:
+    """Remove this tool's standalone commands for an event, not user hooks."""
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
         return False
-    if toml_path.is_file():
-        shutil.copy2(toml_path, toml_path.with_suffix(".toml.auto-startstop.bak"))
-    _atomic_write_text(toml_path, new_text)
-    return True
+    groups = hooks.get(event, [])
+    subcommand = "stop" if event == "Stop" else "session-start"
+    changed = False
+    retained = []
+    for group in groups:
+        handlers = [
+            handler for handler in group["hooks"]
+            if not (
+                handler.get("type") == "command"
+                and _is_our_hook_command(handler.get("command"), subcommand)
+            )
+        ]
+        if len(handlers) != len(group["hooks"]):
+            changed = True
+        if handlers:
+            group["hooks"] = handlers
+            retained.append(group)
+    if retained:
+        hooks[event] = retained
+    else:
+        hooks.pop(event, None)
+    return changed
 
 
 def _rpc_request(codex_bin: str, requests: list, timeout: float = 30.0):
@@ -1264,13 +1294,27 @@ def maybe_redeem_reset_credit(cfg: dict, rl: dict, sid: str, now: float) -> bool
             return False
         credit_resets, credit_label, credit_used = due
         key = f"{credit_label}:{credit_resets}"
+        # Credit consumption is account-wide, not per Codex thread. A second
+        # session must never redeem another credit for the same limit window.
+        previous = (st.get("credit_attempts") or {}).get(key)
+        if isinstance(previous, dict):
+            if previous.get("outcome") == "reset":
+                t["reset_credit_for"] = key
+                t["reset_credit_at"] = previous.get("completed_at", now)
+                t["reset_credit_limit"] = credit_label
+                save_state(st)
+                return True
+            # A pending RPC, an error or a rejected credit must not cause
+            # another paid attempt; let the ordinary handoff handle failures.
+            return False
         if t.get("reset_credit_for") == key:
-            save_state(st)
             return True
         if t.get("reset_credit_tried") == key:
-            save_state(st)
             return False
         t["reset_credit_tried"] = key
+        st.setdefault("credit_attempts", {})[key] = {
+            "outcome": "pending", "started_at": now
+        }
         save_state(st)
 
     outcome = try_redeem_reset_credit(cfg)
@@ -1278,6 +1322,12 @@ def maybe_redeem_reset_credit(cfg: dict, rl: dict, sid: str, now: float) -> bool
         f"stop: reset-credit outcome={outcome} limit={credit_label} "
         f"used={credit_used:.1f}% window={key}"
     )
+    with state_lock():
+        st = load_state()
+        entry = st.setdefault("credit_attempts", {}).setdefault(key, {})
+        entry["outcome"] = outcome
+        entry["completed_at"] = time.time()
+        save_state(st)
     if outcome != "reset":
         if outcome != "unreachable":
             notify_desktop(
@@ -1385,29 +1435,55 @@ def cmd_fetch_hashes(args) -> int:
     return 0
 
 
+def _read_installed_hooks(path: Path) -> dict | None:
+    """Validate existing hooks before making any installation changes."""
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    hooks = data.get("hooks", {})
+    if not isinstance(hooks, dict):
+        return None
+    for groups in hooks.values():
+        if not isinstance(groups, list):
+            return None
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                return None
+            if not all(isinstance(h, dict) for h in group["hooks"]):
+                return None
+    return data
+
+
 def cmd_install(args) -> int:
     cfg = load_config()
     home = codex_home()
     ah = auto_startstop_home()
+    hj = hooks_path()
+    data = _read_installed_hooks(hj)
+    if data is None:
+        print(f"ERROR: {hj} contains invalid JSON or hook entries; unchanged.")
+        return 1
+
     ah.mkdir(parents=True, exist_ok=True)
     home.mkdir(parents=True, exist_ok=True)
-
-    # 1. copy this script into CODEX_HOME/auto-startstop/
     src = Path(__file__).resolve()
     dst = ah / "codex_auto_startstop.py"
     if src != dst:
         shutil.copy2(src, dst)
     dst.chmod(0o755)
 
-    # 2. default config (the handoff prompt is seeded as a markdown file instead)
     if not config_path().exists():
         seed = {k: v for k, v in DEFAULT_CONFIG.items() if k != "stop_message"}
-        _atomic_write_text(config_path(), json.dumps(seed, indent=2))
+        _atomic_write_text(config_path(), json.dumps(seed, indent=2), mode=0o600)
         print(f"wrote default config      {config_path()}")
     else:
         print(f"kept existing config      {config_path()}")
 
-    # 2b. handoff prompt (standalone markdown, easy to edit)
     prompt_dst = ah / "handoff-prompt.md"
     if not prompt_dst.exists():
         text = read_handoff_prompt(_script_prompt_file())
@@ -1416,63 +1492,33 @@ def cmd_install(args) -> int:
     else:
         print(f"kept existing handoff prompt   {prompt_dst}")
 
-    # 3. hooks.json
-    hj = hooks_path()
-    data = {}
-    if hj.is_file():
-        try:
-            data = json.loads(hj.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                data = {}
-            shutil.copy2(hj, hj.with_suffix(".json.auto-startstop.bak"))
-        except json.JSONDecodeError:
-            print(f"ERROR: {hj} is not valid JSON; aborting install")
-            return 1
-    data.setdefault("description", "codex-auto-startstop: 5h-limit auto stop/handoff + auto resume")
+    data.setdefault("description", "codex-auto-startstop: 5h-limit handoff and auto resume")
     stop_cmd = _hooks_json_command(cfg, "stop")
     ss_cmd = _hooks_json_command(cfg, "session-start")
-    changed = _merge_hook_entry(data, "Stop", stop_cmd)
-    changed = _merge_hook_entry(data, "SessionStart", ss_cmd) or changed
-    _atomic_write_text(hj, json.dumps(data, indent=2) + "\n")
-    print(f"hooks {'updated' if changed else 'ok'}          {hj}")
+    _merge_hook_entry(data, "Stop", stop_cmd)
+    _merge_hook_entry(data, "SessionStart", ss_cmd)
+    serialized = json.dumps(data, indent=2) + "\n"
+    old = hj.read_text(encoding="utf-8") if hj.is_file() else None
+    if old != serialized:
+        if hj.is_file():
+            shutil.copy2(hj, hj.with_suffix(".json.auto-startstop.bak"))
+        _atomic_write_text(hj, serialized)
+    print(f"hooks {'updated' if old != serialized else 'unchanged'}          {hj}")
     print(f"  Stop         -> {stop_cmd}")
     print(f"  SessionStart -> {ss_cmd}")
 
-    # 4. trust seeding (untrusted hooks do not run)
-    print("fetching hook hashes from codex (app-server)...")
-    seeded = []
-    try:
-        hooks = fetch_hook_hashes(cfg, args.cwd or os.getcwd())
-    except Exception as exc:  # noqa: BLE001
-        hooks = []
-        print(f"  rpc failed: {exc}")
-    for hook in hooks:
-        if not isinstance(hook, dict):
-            continue
-        command = str(hook.get("command") or "")
-        key = hook.get("key")
-        current_hash = hook.get("current_hash") or hook.get("currentHash")
-        source = str(hook.get("source_path") or hook.get("sourcePath") or "")
-        if not key or not current_hash:
-            continue
-        if str(dst) in command or (str(hj) in source and ("auto_startstop" in command or "auto-startstop" in command)):
-            if _seed_trust(home / "config.toml", key, current_hash):
-                seeded.append(key)
-            print(f"  trusted: {key}")
-    if not seeded:
-        print(
-            "  NOTE: could not seed trust automatically. Hooks will be offered for review\n"
-            "  on the next interactive Codex start -> choose \"Trust all and continue\" once.\n"
-            "  (Headless runs can use --dangerously-bypass-hook-trust.)"
-        )
-
+    # Installing a command is NOT permission to execute it.
+    # Leave config.toml and its trusted_hash entries completely untouched.
     print()
-    print("Installed. Next steps:")
-    print("  - use Codex normally:  codex   (interactive)  /  codex exec ...")
-    print(f"  - default steer threshold: {cfg.get('stop_percent')}% of the 5h window")
-    print(f"  - tune:  edit {config_path()}")
-    print(f"  - check: python3 {dst} status")
-    print(f"  - remove: python3 {dst} uninstall")
+    print("Installed, but NOT trusted. Review these two commands in Codex's")
+    print("interactive hook trust UI (or Settings > Hooks), then approve")
+    print("only the hooks you recognize. Do not bypass hook trust.")
+    print("On some Codex builds rows are Hook 1 / Hook 2 / unknown;")
+    print("identify them by their event, command and status message.")
+    print(f"Default threshold: {cfg.get('stop_percent')}% of the 5h window")
+    print(f"Configure: {config_path()}")
+    print(f"Status: python3 {dst} status")
+    print(f"Uninstall: python3 {dst} uninstall")
     return 0
 
 
@@ -1486,9 +1532,8 @@ def cmd_uninstall(args) -> int:
         except json.JSONDecodeError:
             data = None
         if isinstance(data, dict):
-            command = _hooks_json_command(cfg, "stop")
-            changed = _remove_hook_entry(data, command)
-            changed = _remove_hook_entry(data, _hooks_json_command(cfg, "session-start")) or changed
+            changed = _remove_hook_entry(data, "Stop")
+            changed = _remove_hook_entry(data, "SessionStart") or changed
             if changed:
                 shutil.copy2(hj, hj.with_suffix(".json.auto-startstop.bak"))
                 _atomic_write_text(hj, json.dumps(data, indent=2) + "\n")
@@ -1538,7 +1583,7 @@ def main(argv=None) -> int:
     p_cred = sub.add_parser("credits", help="show available usage-limit reset credits (RPC)")
     p_cred.set_defaults(func=cmd_credits)
 
-    p_inst = sub.add_parser("install", help="install hooks.json + trust")
+    p_inst = sub.add_parser("install", help="register hooks for explicit user approval")
     p_inst.add_argument("--cwd")
     p_inst.set_defaults(func=cmd_install)
 
