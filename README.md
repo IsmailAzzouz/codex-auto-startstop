@@ -34,7 +34,7 @@ codex plugin marketplace add IsmailAzzouz/codex-auto-startstop
 codex plugin add codex-auto-startstop@codex-auto-startstop
 ```
 
-Restart Codex, review the `Stop` and `SessionStart` hook commands, and approve them when prompted. Verify the installation with `codex plugin list`.
+Restart Codex, **review the `Stop` and `SessionStart` commands and explicitly approve them** in the interactive hook review flow. Installing the plugin does not grant execution permission. Verify the installation with `codex plugin list`. If the desktop app does not show an approval prompt, use the interactive CLI to review pending hooks.
 
 ### Standalone
 
@@ -43,7 +43,15 @@ git clone https://github.com/IsmailAzzouz/codex-auto-startstop.git
 python3 codex-auto-startstop/codex_auto_startstop.py install
 ```
 
-The installer copies the script to `~/.codex/auto-startstop/`, creates a default configuration, seeds the editable handoff prompt (see [Handoff prompt](#handoff-prompt)), and registers the hooks in `~/.codex/hooks.json`. Review and approve the hooks if Codex requests it.
+The installer copies the script to `~/.codex/auto-startstop/`, creates a default configuration, seeds the editable handoff prompt (see [Handoff prompt](#handoff-prompt)), and registers the hooks in `~/.codex/hooks.json`. **It never edits `config.toml` to trust hooks automatically.** Open interactive Codex, inspect the two registered commands, and explicitly approve each one before expecting them to run. An untrusted hook will be skipped.
+
+### Recognizing hooks in Codex
+
+For standalone installs, commands point to `~/.codex/auto-startstop/codex_auto_startstop.py` with `stop` or `session-start`. For plugins, they reference `${PLUGIN_ROOT}/codex_auto_startstop.py`. Both handlers have a descriptive `statusMessage`.
+
+Some Codex versions display **"Hook 1", "Hook 2", or "unknown"** rather than a custom title. Codex currently lacks a supported per-hook display-name field: `statusMessage` helps in expanded details but does not override every client's row title. Identify hooks by their **event, source, and command**. See the [upstream naming limitation](https://github.com/openai/codex/issues/41611).
+
+Before trusting a command, inspect the file it executes. Do not use `--dangerously-bypass-hook-trust` as an installation step.
 
 ## Configuration
 
@@ -90,7 +98,7 @@ If your Codex account has usage-limit reset credits, setting `use_reset_credits`
 
 `reset_credit_on` selects which window can trigger a redemption attempt. It is `"weekly"` by default. With reset credits enabled, that window is monitored even if it is not selected by `trigger`, so a failed attempt can still fall back to a handoff.
 
-**Enabling this option can spend real credits from your account without further confirmation.** It is disabled by default.
+**Enabling this option can spend real credits from your account without further confirmation when the selected window reaches its threshold.** It is disabled by default (`false`), and the installer does not enable it. Only opt in if you accept this automatic consumption.
 
 ## Status and logs
 
@@ -115,6 +123,7 @@ tail -f ~/.codex/auto-startstop/auto-startstop.log
 - The `Stop` hook runs at turn boundaries; it cannot interrupt a turn that has already reached the usage limit.
 - The handoff is an instruction to Codex, not a guarantee that `HANDOFF.md` will be written. If it is missing, the continuation message asks Codex to reconstruct the task status.
 - If the machine is off when a reset occurs, the helper cannot run. The `SessionStart` hook can re-arm pending work when the session is opened again.
+- For a weekly reset several days away, the detached helper remains alive until the scheduled continuation (unless the machine or process stops); there is no eight-hour cutoff.
 - If there is user activity after the reset, automatic continuation is skipped to avoid interrupting ongoing work.
 - Queued continuation depends on the Codex CLI's app-server and message queue behavior.
 
@@ -132,7 +141,7 @@ For a standalone installation:
 python3 ~/.codex/auto-startstop/codex_auto_startstop.py uninstall
 ```
 
-Add `--purge` to the standalone uninstall command to remove runtime state. This does not automatically remove previously trusted hook entries from Codex's configuration.
+Add `--purge` to the standalone uninstall command to remove runtime state. This does not automatically remove previously trusted hook entries from Codex's configuration. Entries written by versions before 1.0.1 are not revoked automatically; review them manually if necessary.
 
 ## Tests
 
