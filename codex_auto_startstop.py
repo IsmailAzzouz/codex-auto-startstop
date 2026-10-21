@@ -1294,13 +1294,27 @@ def maybe_redeem_reset_credit(cfg: dict, rl: dict, sid: str, now: float) -> bool
             return False
         credit_resets, credit_label, credit_used = due
         key = f"{credit_label}:{credit_resets}"
+        # Credit consumption is account-wide, not per Codex thread. A second
+        # session must never redeem another credit for the same limit window.
+        previous = (st.get("credit_attempts") or {}).get(key)
+        if isinstance(previous, dict):
+            if previous.get("outcome") == "reset":
+                t["reset_credit_for"] = key
+                t["reset_credit_at"] = previous.get("completed_at", now)
+                t["reset_credit_limit"] = credit_label
+                save_state(st)
+                return True
+            # A pending RPC, an error or a rejected credit must not cause
+            # another paid attempt; let the ordinary handoff handle failures.
+            return False
         if t.get("reset_credit_for") == key:
-            save_state(st)
             return True
         if t.get("reset_credit_tried") == key:
-            save_state(st)
             return False
         t["reset_credit_tried"] = key
+        st.setdefault("credit_attempts", {})[key] = {
+            "outcome": "pending", "started_at": now
+        }
         save_state(st)
 
     outcome = try_redeem_reset_credit(cfg)
@@ -1308,6 +1322,12 @@ def maybe_redeem_reset_credit(cfg: dict, rl: dict, sid: str, now: float) -> bool
         f"stop: reset-credit outcome={outcome} limit={credit_label} "
         f"used={credit_used:.1f}% window={key}"
     )
+    with state_lock():
+        st = load_state()
+        entry = st.setdefault("credit_attempts", {}).setdefault(key, {})
+        entry["outcome"] = outcome
+        entry["completed_at"] = time.time()
+        save_state(st)
     if outcome != "reset":
         if outcome != "unreachable":
             notify_desktop(
