@@ -618,6 +618,36 @@ def test_builtin_prompt_when_no_file(tmp: Path) -> None:
     check("built-in prompt used", data.get("builtin") is True, str(data)[:200])
 
 
+def test_credit_deduplicated_across_sessions(tmp: Path) -> None:
+    print("test: two sessions at the same limit window redeem only one credit")
+    home, sessions, env, fake_log = make_sandbox(tmp)
+    write_config(home, use_reset_credits=True, reset_credit_on="weekly")
+    resets = time.time() + 500000
+    first_rollout = write_rollout(
+        sessions, used=20.0, resets_at=time.time() + 3600,
+        weekly_used=95.0, weekly_resets=resets
+    )
+    second_sid = "01a12233-a8f7-7cc2-842d-e1f79c5028e4"
+    second_rollout = first_rollout.with_name(first_rollout.name.replace(SID, second_sid))
+    second_rollout.write_text(
+        first_rollout.read_text(encoding="utf-8").replace(SID, second_sid),
+        encoding="utf-8"
+    )
+    first = run_cli(["stop"], env, hook_input())
+    second_input = dict(hook_input())
+    second_input["session_id"] = second_sid
+    second_input["transcript_path"] = str(second_rollout)
+    second = run_cli(["stop"], env, second_input)
+    check("both sessions exit successfully",
+          first.returncode == 0 and second.returncode == 0)
+    check("second session skips unnecessary handoff", second.stdout.strip() == "")
+    check("at most one account-wide redemption",
+          len(_credit_calls(fake_log)) == 1, str(_credit_calls(fake_log)))
+    check("second session records shared credit",
+          state(home)["threads"][second_sid].get("reset_credit_for")
+          == state(home)["threads"][SID].get("reset_credit_for"))
+
+
 def test_install_requires_hook_approval(tmp: Path) -> None:
     print("test: install never trusts hooks and preserves unrelated hook definitions")
     home, _sessions, env, _ = make_sandbox(tmp)
@@ -727,6 +757,7 @@ def main() -> int:
         test_credit_unavailable_falls_back,
         test_credit_on_5h,
         test_credit_once_per_window,
+        test_credit_deduplicated_across_sessions,
         test_handoff_prompt_file,
         test_config_stop_message_overrides_file,
         test_handoff_prompt_file_edges,
