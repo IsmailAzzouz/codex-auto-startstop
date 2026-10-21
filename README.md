@@ -4,6 +4,7 @@
 
 [![CI](https://github.com/IsmailAzzouz/codex-auto-startstop/actions/workflows/ci.yml/badge.svg)](https://github.com/IsmailAzzouz/codex-auto-startstop/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/IsmailAzzouz/codex-auto-startstop)](https://github.com/IsmailAzzouz/codex-auto-startstop/releases/latest)
 
 Automatically hand off a Codex task before a usage limit and resume it in the same session after the limit resets.
 
@@ -14,6 +15,37 @@ Uses Codex's `Stop` and `SessionStart` hooks, with no third-party Python depende
 At the end of a turn, the `Stop` hook checks the session's locally recorded usage. When the configured threshold is reached, it asks Codex to write a `HANDOFF.md` summary and stop. A detached helper then schedules a continuation through `codex queue` after the reset. The `SessionStart` hook can re-arm a pending continuation after a restart.
 
 By default, the tool monitors the 5-hour usage window at 85%. It can also monitor the weekly window. Optional reset credits can bypass the handoff when a redemption succeeds.
+
+
+### Workflow diagram
+
+GitHub renders this Mermaid diagram directly in the README. The normal path requires **no reset credits** and never spends them unless the user explicitly opts in.
+
+```mermaid
+flowchart TD
+    A["Codex finishes a turn"] --> B["Stop hook reads the session's local usage snapshot"]
+    B --> C{"Configured usage threshold reached?"}
+    C -- "No / no usable data" --> D["Allow normal stop (fail-open)"]
+    C -- "Yes" --> E{"Automatic reset credits enabled and eligible?"}
+    E -- Yes --> F["Attempt at most one credit redemption per quota window"]
+    F --> G{"Reset succeeded?"}
+    G -- Yes --> D
+    G -- No --> H["Record handoff and reset time"]
+    E -- No --> H
+    H --> I["Ask Codex to write HANDOFF.md (DONE / NEXT / BLOCKED / RESUME)"]
+    I --> J["Codex stops the task"]
+    H --> K["Detached helper waits until reset + safety buffer"]
+    K --> L{"Activity in the session after reset?"}
+    L -- Yes --> M["Skip auto-resume to avoid interrupting user"]
+    L -- No --> N["codex queue sends a continuation to the same session"]
+    N --> O["Read HANDOFF.md, continue the task"]
+    P["Codex starts or reopens a session"] --> Q{"Pending continuation?"}
+    Q -- Yes --> R["SessionStart hook re-arms helper"]
+    R --> K
+    Q -- No --> S["Continue normally"]
+```
+
+*The Stop hook runs only at turn boundaries.* Reaching the threshold cannot interrupt an ongoing turn; its handoff instruction is not a guarantee that Codex will write the file. If Codex is already exhausted, the hook can schedule recovery without asking the model to write a report. If the machine is off at reset, the helper cannot deliver the message until Codex runs again and SessionStart re-arms it. Resume is optional, and existing user activity prevents an automatic interruption.
 
 ## Requirements
 
@@ -152,6 +184,23 @@ python3 tests/synthetic_test.py
 The synthetic suite tests threshold decisions, per-window deduplication, resume scheduling, activity checks, and reset-credit decisions without consuming real account credits. GitHub Actions runs it on Linux and macOS with Python 3.10 and 3.13.
 
 Reset-credit redemption is tested with a simulated app-server; it has not been verified by spending a real credit as part of the test suite.
+
+
+## Development and automatic GitHub releases
+
+All pull requests and pushes to `main` run the **four CI test jobs** (Linux and macOS with Python 3.10 and 3.13). They cover the hooks, installation safety, and release-version logic. **A failed or cancelled test job prevents publication.** Forked pull requests run with read-only permissions and never publish releases.
+
+For each successful, new push to `main`, the release job:
+
+1. Selects the next `vMAJOR.MINOR.PATCH` version. A manually committed higher version (for example `1.2.0`) is respected; otherwise, the patch version increments.
+2. Synchronizes the version in `codex_auto_startstop.py` and `.codex-plugin/plugin.json`. When a bump is needed, it makes a version-only `chore(release)` commit on `main` with `[skip ci]`.
+3. Creates an annotated Git tag and publishes a GitHub Release with automatically generated release notes. The source ZIP and tarball are automatically provided by GitHub.
+
+No personal access token or third-party publishing service is necessary: only the publish job receives `GITHUB_TOKEN` with `contents: write`. The workflow serializes releases, never overwrites an existing version tag, and can be rerun without creating a duplicate. If another commit arrives before an older run can publish, the newer CI run becomes responsible for the latest code, rather than releasing an untested commit.
+
+The current workflow uses a small version-only commit on `main` to keep the published source and plugin versions consistent. **If you enable branch protection that blocks GitHub Actions from pushing to `main`, this step will fail safely; allow this narrow automation or migrate to a release-PR approach.** Release publication does not run for a PR or before it is merged.
+
+Releases: [latest version](https://github.com/IsmailAzzouz/codex-auto-startstop/releases/latest) · [CI and release workflow](.github/workflows/ci.yml).
 
 ## License
 
