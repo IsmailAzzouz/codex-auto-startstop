@@ -69,7 +69,7 @@ try:  # POSIX only; hook state locking degrades to a no-op elsewhere
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 DEFAULT_CONFIG = {
     "trigger": "5h",
