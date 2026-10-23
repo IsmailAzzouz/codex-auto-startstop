@@ -10,11 +10,13 @@ Run:  python3 tests/synthetic_test.py
 
 from __future__ import annotations
 
+import http.server
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -144,6 +146,7 @@ def make_sandbox(tmp: Path):
             "CODEX_AUTO_STARTSTOP_SESSIONS_DIR": str(sessions),
             "CODEX_AUTO_STARTSTOP_STOP_PERCENT": "80",
             "CODEX_AUTO_STARTSTOP_CODEX_BIN": f"{PY} {fake}",
+            "CODEX_AUTO_STARTSTOP_UPDATE_URL": "http://127.0.0.1:9/latest",
             "CODEX_AUTO_STARTSTOP_NO_SPAWN": "1",
             "FAKE_CODEX_LOG": str(fake_log),
             "FAKE_RESET_OUTCOME": "reset",
@@ -391,6 +394,134 @@ def test_session_start(tmp: Path) -> None:
     check("additionalContext present", bool(ctx), proc.stdout[:200])
     check("context mentions handoff", "HANDOFF.md" in ctx)
 
+
+
+class _ReleaseHandler(http.server.BaseHTTPRequestHandler):
+    """Minimal GitHub-like /releases/latest redirect."""
+
+    version = "9.9.9"
+    location = None
+
+    def do_GET(self):  # noqa: N802 - stdlib handler API
+        if self.path == "/latest":
+            self.send_response(302)
+            self.send_header("Location", self.location or f"/releases/tag/v{self.version}")
+            self.end_headers()
+        elif self.path.startswith("/releases/"):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+class _ForeignRedirect(_ReleaseHandler):
+    location = "https://example.invalid/releases/tag/v9.9.9"
+
+
+class _NotAReleasePage(_ReleaseHandler):
+    location = "/releases/notes"
+
+
+def _serve(handler) -> http.server.HTTPServer:
+    server = http.server.HTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def _log_text(home: Path) -> str:
+    path = home / "auto-startstop" / "auto-startstop.log"
+    return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+
+def test_update_notice(tmp: Path) -> None:
+    print("test: session-start reports a newer release once")
+    home, _sessions, env, _ = make_sandbox(tmp)
+    server = _serve(_ReleaseHandler)
+    try:
+        env["CODEX_AUTO_STARTSTOP_UPDATE_URL"] = (
+            f"http://127.0.0.1:{server.server_port}/latest"
+        )
+        start = {"session_id": SID, "cwd": CWD, "hook_event_name": "SessionStart"}
+        proc = run_cli(["session-start"], env, start)
+        out = _json(proc.stdout)
+        ctx = (out.get("hookSpecificOutput") or {}).get("additionalContext", "")
+        check("notice shows version", "v9.9.9" in ctx, proc.stdout[:300])
+        check("notice names the update route", "git pull" in ctx, ctx[:300])
+        check("notice warns about approval", "approve the hooks again" in ctx, ctx[:300])
+        check("notice is user visible", "v9.9.9" in str(out.get("systemMessage")), proc.stdout[:300])
+        second = run_cli(["session-start"], env, start)
+        check("notice shown once", "v9.9.9" not in second.stdout, second.stdout[:300])
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_update_check_offline(tmp: Path) -> None:
+    print("test: offline update check fails open")
+    home, _sessions, env, _ = make_sandbox(tmp)
+    proc = run_cli(
+        ["session-start"], env, {"session_id": SID, "cwd": CWD, "hook_event_name": "SessionStart"}
+    )
+    check("exit 0", proc.returncode == 0, proc.stderr[-300:])
+    check("no output", proc.stdout == "", proc.stdout[:300])
+
+
+def test_update_redirect_refused(tmp: Path) -> None:
+    print("test: update check refuses a redirect to another host")
+    home, _sessions, env, _ = make_sandbox(tmp)
+    server = _serve(_ForeignRedirect)
+    try:
+        env["CODEX_AUTO_STARTSTOP_UPDATE_URL"] = (
+            f"http://127.0.0.1:{server.server_port}/latest"
+        )
+        proc = run_cli(
+            ["session-start"], env,
+            {"session_id": SID, "cwd": CWD, "hook_event_name": "SessionStart"},
+        )
+        check("exit 0", proc.returncode == 0, proc.stderr[-300:])
+        check("no notice", proc.stdout == "", proc.stdout[:300])
+        check("refusal logged", "redirect refused" in _log_text(home), _log_text(home)[-300:])
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_update_parse_failure(tmp: Path) -> None:
+    print("test: update check logs a non-release final URL")
+    home, _sessions, env, _ = make_sandbox(tmp)
+    server = _serve(_NotAReleasePage)
+    try:
+        env["CODEX_AUTO_STARTSTOP_UPDATE_URL"] = (
+            f"http://127.0.0.1:{server.server_port}/latest"
+        )
+        proc = run_cli(
+            ["session-start"], env,
+            {"session_id": SID, "cwd": CWD, "hook_event_name": "SessionStart"},
+        )
+        check("exit 0", proc.returncode == 0, proc.stderr[-300:])
+        check("no notice", proc.stdout == "", proc.stdout[:300])
+        check("parse failure logged", "not a release page" in _log_text(home), _log_text(home)[-300:])
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_update_bad_config(tmp: Path) -> None:
+    print("test: malformed update config fails open")
+    home, _sessions, env, _ = make_sandbox(tmp)
+    write_config(home, update_check_hours="daily")
+    proc = run_cli(
+        ["session-start"], env,
+        {"session_id": SID, "cwd": CWD, "hook_event_name": "SessionStart"},
+    )
+    check("exit 0", proc.returncode == 0, proc.stderr[-300:])
+    check("no notice", proc.stdout == "", proc.stdout[:300])
+    check("no fatal", "FATAL" not in _log_text(home), _log_text(home)[-300:])
 
 def test_status(tmp: Path) -> None:
     print("test: status prints limits + state")
@@ -819,9 +950,7 @@ def test_platform_hook_commands(tmp: Path) -> None:
         check(
             f"{event}: commandWindows uses the Python launcher",
             handler.get("commandWindows") == expected_windows,
-            repr(handler.get("commandWindows")),
         )
-
     if os.name != "nt":
         return
 
@@ -877,6 +1006,11 @@ def main() -> int:
         test_resume_dispatch,
         test_resume_skips_on_activity,
         test_session_start,
+        test_update_notice,
+        test_update_check_offline,
+        test_update_redirect_refused,
+        test_update_parse_failure,
+        test_update_bad_config,
         test_status,
         test_weekly_trigger,
         test_weekly_ignored_when_trigger_5h,

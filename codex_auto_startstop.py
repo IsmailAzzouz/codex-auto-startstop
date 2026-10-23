@@ -48,6 +48,7 @@ Env overrides (mostly for tests):
   CODEX_HOME, CODEX_AUTO_STARTSTOP_HOME, CODEX_AUTO_STARTSTOP_SESSIONS_DIR,
   CODEX_AUTO_STARTSTOP_STOP_PERCENT, CODEX_AUTO_STARTSTOP_RESUME_BUFFER_SEC,
   CODEX_AUTO_STARTSTOP_FORCE_RESUME_IN (debug: seconds), CODEX_AUTO_STARTSTOP_CODEX_BIN,
+  CODEX_AUTO_STARTSTOP_UPDATE_URL (update-check source),
   CODEX_AUTO_STARTSTOP_NO_SPAWN=1 (don't spawn detached helper), CODEX_AUTO_STARTSTOP_POLL_SEC
 """
 
@@ -67,6 +68,9 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -77,6 +81,12 @@ except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
 VERSION = "1.0.4"
+
+# Update check: GitHub redirects /releases/latest to the current tag. This is
+# one HTTPS request to a web page, not an API call, so there is no token and no
+# API rate-limit budget to manage.
+UPDATE_URL = "https://github.com/IsmailAzzouz/codex-auto-startstop/releases/latest"
+UPDATE_RETRY_SEC = 3600
 
 DEFAULT_CONFIG = {
     "trigger": "5h",
@@ -90,6 +100,9 @@ DEFAULT_CONFIG = {
     "codex_bin": "codex",
     "python": sys.executable or "python3",
     "notify_desktop": True,
+    "check_updates": True,
+    "update_check_hours": 24,
+    "update_url": UPDATE_URL,
     "stop_message": (
         "\u26d4 codex-auto-startstop: the {window} is at {percent:.0f}% "
         "(resets {reset_local}, about {minutes_left:.0f} min left). Do not start new work. "
@@ -131,6 +144,10 @@ def sessions_dir() -> Path:
 
 def state_path() -> Path:
     return auto_startstop_home() / "state.json"
+
+
+def update_state_path() -> Path:
+    return auto_startstop_home() / "update.json"
 
 
 def config_path() -> Path:
@@ -272,6 +289,7 @@ def load_config() -> dict:
         "CODEX_AUTO_STARTSTOP_RESUME_BUFFER_SEC": ("resume_buffer_sec", float),
         "CODEX_AUTO_STARTSTOP_CODEX_BIN": ("codex_bin", str),
         "CODEX_AUTO_STARTSTOP_POLL_SEC": ("poll_sec", float),
+        "CODEX_AUTO_STARTSTOP_UPDATE_URL": ("update_url", str),
     }
     for env, (key, cast) in env_map.items():
         if env in os.environ:
@@ -845,6 +863,133 @@ def cmd_resume_check(args) -> int:
     return cmd_sleeper(args)
 
 
+# --------------------------------------------------------------------------- update check
+
+
+def _version_tuple(text: object) -> tuple | None:
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", str(text or "").strip())
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def _float_or(value: object, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _allowed_update_url(url: str) -> bool:
+    """HTTPS anywhere, plain HTTP only on loopback (tests)."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme == "https":
+        return True
+    return parts.scheme == "http" and parts.hostname in ("127.0.0.1", "localhost", "::1")
+
+
+class _SameHostRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse a redirect that leaves the configured host or drops HTTPS."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old_host = urllib.parse.urlsplit(req.full_url).hostname
+        new_host = urllib.parse.urlsplit(newurl).hostname
+        if not _allowed_update_url(newurl) or new_host != old_host:
+            raise urllib.error.HTTPError(newurl, code, "redirect refused", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _release_version(url: str) -> str | None:
+    """Version from a releases/tag/vX.Y.Z URL, or from a bare version path."""
+    tail = str(url).split("?", 1)[0].split("#", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+    if tail.startswith("v"):
+        tail = tail[1:]
+    return tail if _version_tuple(tail) else None
+
+
+def fetch_latest_version(cfg: dict) -> str | None:
+    """Newest published version.
+
+    Raises when the URL is unsafe, unreachable, or does not resolve to a
+    release tag. The caller logs the reason and retries later.
+    """
+    url = str(cfg.get("update_url") or UPDATE_URL)
+    if not _allowed_update_url(url):
+        raise ValueError(f"update_url must be https: {url}")
+    request = urllib.request.Request(
+        url, headers={"User-Agent": f"codex-auto-startstop/{VERSION}"}
+    )
+    opener = urllib.request.build_opener(_SameHostRedirect())
+    with opener.open(request, timeout=3) as response:
+        final = response.geturl() or url
+    version = _release_version(final)
+    if not version:
+        raise ValueError(f"not a release page: {final}")
+    return version
+
+
+def _read_update_state() -> dict:
+    try:
+        data = json.loads(update_state_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _update_command() -> str:
+    here = Path(__file__).resolve().as_posix()
+    if "/plugins/cache/" in here:
+        return "codex plugin marketplace upgrade codex-auto-startstop"
+    return "git pull, then run python3 codex_auto_startstop.py install"
+
+
+def update_notice(cfg: dict, now: float | None = None) -> str | None:
+    """One notice per released version, at most once per check interval.
+
+    Fails open. A bad config value, an offline machine, or a broken URL never
+    breaks SessionStart.
+    """
+    if not cfg.get("check_updates", True):
+        return None
+    now = time.time() if now is None else float(now)
+    hours = _float_or(cfg.get("update_check_hours", 24), 24.0)
+    if hours <= 0:
+        hours = 24.0
+    state = _read_update_state()
+    cached = state.get("latest") if isinstance(state.get("latest"), str) else None
+    checked_at = _float_or(state.get("checked_at"), 0.0)
+    max_age = UPDATE_RETRY_SEC if cached is None else hours * 3600
+    latest = cached
+    fetched = False
+    if now - checked_at >= max_age:
+        fetched = True
+        try:
+            latest = fetch_latest_version(cfg)
+        except Exception as exc:  # noqa: BLE001 - a check must never break a session
+            log(f"update: check failed: {exc}")
+            latest = None
+    notice = None
+    # ponytail: shares state.lock, so this is a no-op on Windows like state.json.
+    with state_lock():
+        state = _read_update_state()
+        if fetched:
+            state["checked_at"] = now
+            state["latest"] = latest
+        latest = state.get("latest") if isinstance(state.get("latest"), str) else None
+        current = _version_tuple(VERSION)
+        remote = _version_tuple(latest)
+        if current and remote and remote > current and state.get("notified") != latest:
+            state["notified"] = latest
+            notice = (
+                f"codex-auto-startstop: update available: v{latest} (installed {VERSION}). "
+                f"Update: {_update_command()}. "
+                "Codex will ask you to approve the hooks again after the update."
+            )
+        if fetched or notice:
+            _atomic_write_text(update_state_path(), json.dumps(state))
+    if notice:
+        log(f"update: available {latest} (installed {VERSION})")
+    return notice
+
+
 # --------------------------------------------------------------------------- hooks
 
 
@@ -1090,25 +1235,39 @@ def cmd_session_start(_args) -> int:
     if not sid:
         return 0
     cfg = load_config()
+    notice = update_notice(cfg)
+    contexts = []
     with state_lock():
         st = load_state()
         t = dict(st["threads"].get(sid) or {})
-    if not t.get("resume_at"):
-        return 0
-    if t.get("resume_sent_at") or t.get("resume_skipped") or t.get("resume_failed"):
-        return 0
-    ensure_sleeper(sid)
-    log(f"session-start: pending resume for {sid} (resume_at={t.get('resume_at')})")
-    if time.time() >= float(t["resume_at"]) - 60:
-        ctx = render(
-            cfg["session_start_context"],
-            window=_limit_label(t.get("steered_limit", "5h")),
-            handoff_file=cfg.get("handoff_file", "HANDOFF.md"),
-            reset_local=fmt_reset(t.get("window_resets_at")),
-        )
-        _print_hook_output(
-            {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}
-        )
+    if t.get("resume_at") and not (
+        t.get("resume_sent_at") or t.get("resume_skipped") or t.get("resume_failed")
+    ):
+        ensure_sleeper(sid)
+        log(f"session-start: pending resume for {sid} (resume_at={t.get('resume_at')})")
+        if time.time() >= float(t["resume_at"]) - 60:
+            contexts.append(
+                render(
+                    cfg["session_start_context"],
+                    window=_limit_label(t.get("steered_limit", "5h")),
+                    handoff_file=cfg.get("handoff_file", "HANDOFF.md"),
+                    reset_local=fmt_reset(t.get("window_resets_at")),
+                )
+            )
+    if notice:
+        contexts.append(notice)
+        notify_desktop(cfg, "codex-auto-startstop", notice)
+    if contexts:
+        payload = {
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": "\n\n".join(contexts),
+            }
+        }
+        if notice:
+            # Codex shows systemMessage to the user; additionalContext goes to the model.
+            payload["systemMessage"] = notice
+        _print_hook_output(payload)
     return 0
 
 
@@ -1127,6 +1286,10 @@ def cmd_status(args) -> int:
             sid = max(threads, key=lambda k: threads[k].get("last_seen") or 0)
     t = dict((st.get("threads") or {}).get(sid) or {}) if sid else {}
     print(f"codex-auto-startstop v{VERSION}  (state: {state_path()})")
+    cached = _read_update_state()
+    cached_latest = cached.get("latest")
+    if _version_tuple(cached_latest) and _version_tuple(cached_latest) > _version_tuple(VERSION):
+        print(f"update:      v{cached_latest} available - {_update_command()}")
     if not sid:
         print("no session found - pass --thread <session-uuid>")
         return 0

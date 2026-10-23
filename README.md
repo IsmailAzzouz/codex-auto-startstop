@@ -119,6 +119,9 @@ Configuration is read from `~/.codex/auto-startstop/config.json`. The standalone
 | `resume` | `true` | Enable automatic continuation |
 | `handoff_file` | `"HANDOFF.md"` | Handoff filename in the session working directory |
 | `notify_desktop` | `true` | Enable desktop notifications when supported |
+| `check_updates` | `true` | Check GitHub for a newer release at session start |
+| `update_check_hours` | `24` | Hours between update checks |
+| `update_url` | latest release page | Page used by the check; override for a fork |
 | `use_reset_credits` | `false` | Allow automatic redemption of reset credits |
 | `reset_credit_on` | `"weekly"` | Window eligible to trigger redemption: `5h`, `weekly`, or `both` |
 | `codex_bin` | `"codex"` | Codex executable path |
@@ -144,6 +147,23 @@ The prompt that asks Codex to wrap up lives in its own markdown file, so you can
 At send time the `Stop` hook fills in `{window}`, `{percent}`, `{minutes_left}`, `{reset_local}`, `{handoff_file}`, and `{handoff_path}`. Keep `{handoff_file}` so Codex knows which file to write. For compatibility, a `stop_message` value in `config.json` still overrides the file.
 
 The prompt file is optional and never fatal: if it is missing, empty, unreadable, larger than 64 KiB, or not valid UTF-8, the built-in prompt is used instead. A UTF-8 BOM and Windows line endings are normalised, and a literal `{` or `}` in your markdown (a JSON or code sample) does not stop the placeholders from being filled in.
+
+
+### Update notifications
+
+At session start, the tool asks GitHub for the newest release tag. When a newer
+version exists, it shows the update command once for that version. The check
+does not block the session when the network is down or the URL is unreachable.
+
+- Plugin install: `codex plugin marketplace upgrade codex-auto-startstop`
+- Standalone install: update your checkout, then run `python3 codex_auto_startstop.py install`
+- Codex asks you to approve the hooks again after an update. Hook trust is bound
+  to the script content, so this prompt is expected.
+- The check makes one HTTPS request to the release page, at most once every
+  `update_check_hours`. The result is stored in `~/.codex/auto-startstop/update.json`.
+- The request must stay on the configured host over HTTPS. The tool refuses a
+  redirect to another host or to plain HTTP.
+- Set `check_updates` to `false` to disable the check.
 
 ### Optional reset credits
 
