@@ -4,3 +4,5 @@ __pycache__/
 *.autostop.bak
 .livetest/
 .DS_Store
+.foundry/
+WorkingSessions/
