@@ -28,26 +28,35 @@ GitHub renders this Mermaid diagram directly in the README. The normal path requ
 
 ```mermaid
 flowchart TD
-    A["Codex finishes a turn"] --> B["Stop hook reads the session's local usage snapshot"]
-    B --> C{"Configured usage threshold reached?"}
-    C -- "No / no usable data" --> D["Allow normal stop (fail-open)"]
-    C -- "Yes" --> E{"Automatic reset credits enabled and eligible?"}
-    E -- Yes --> F["Attempt at most one credit redemption per quota window"]
-    F --> G{"Reset succeeded?"}
-    G -- Yes --> D
-    G -- No --> H["Record handoff and reset time"]
-    E -- No --> H
-    H --> I["Ask Codex to write HANDOFF.md (DONE / NEXT / BLOCKED / RESUME)"]
-    I --> J["Codex stops the task"]
-    H --> K["Detached helper waits until reset + safety buffer"]
-    K --> L{"Activity in the session after reset?"}
-    L -- Yes --> M["Skip auto-resume to avoid interrupting user"]
-    L -- No --> N["codex queue sends a continuation to the same session"]
-    N --> O["Read HANDOFF.md, continue the task"]
-    P["Codex starts or reopens a session"] --> Q{"Pending continuation?"}
-    Q -- Yes --> R["SessionStart hook re-arms helper"]
-    R --> K
-    Q -- No --> S["Continue normally"]
+    A["Codex activity"] --> B{"Hook event"}
+
+    B -- "PreToolUse / PostToolUse" --> C{"Threshold reached<br/>and quota available?"}
+    C -- Yes --> D["Inject HANDOFF instructions<br/>once per quota window"]
+    C -- No --> E["Continue normally"]
+    D --> E
+
+    B -- Stop --> F["Check usage<br/>Try optional reset credit"]
+    F --> G{"Limit still reached?"}
+    G -- No --> E
+    G -- Yes --> H{"Quota exhausted?"}
+
+    H -- No --> I["Request HANDOFF.md<br/>via Stop block if needed"]
+    H -- Yes --> J["Schedule auto-resume"]
+    I --> J
+
+    B -- SessionStart --> K["Check for updates<br/>Re-arm pending resume"]
+    K -. "If pending" .-> L
+
+    J --> L["Wait for reset + buffer"]
+    L --> M{"Session active?"}
+    M -- Yes --> N["Skip auto-resume"]
+    M -- No --> O["codex queue<br/>Same session"]
+    O --> P["Resume task<br/>Read HANDOFF.md<br/>or reconstruct context"]
+
+    style D fill:#e8f1ff,stroke:#5684bd,color:#172b45
+    style I fill:#fff3e1,stroke:#cb963f,color:#47351a
+    style J fill:#e7f5ee,stroke:#60a686,color:#193e2e
+    style P fill:#e7f5ee,stroke:#60a686,color:#193e2e
 ```
 
 *The tool hooks check usage only when a tool runs, and the Stop hook checks at a
