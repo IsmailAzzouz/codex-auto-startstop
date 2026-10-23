@@ -1,6 +1,34 @@
 {
   "description": "codex-auto-startstop: hand off before the 5h limit, resume after the reset",
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/codex_auto_startstop.py\" checkpoint",
+            "commandWindows": "py -3 \"%PLUGIN_ROOT%\\codex_auto_startstop.py\" checkpoint",
+            "timeout": 30,
+            "statusMessage": "codex-auto-startstop: check usage before a tool call"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/codex_auto_startstop.py\" checkpoint",
+            "commandWindows": "py -3 \"%PLUGIN_ROOT%\\codex_auto_startstop.py\" checkpoint",
+            "timeout": 30,
+            "statusMessage": "codex-auto-startstop: check usage after a tool call"
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

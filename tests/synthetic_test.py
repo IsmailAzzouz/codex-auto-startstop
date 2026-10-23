@@ -170,12 +170,12 @@ def state(home: Path) -> dict:
     return json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {"threads": {}}
 
 
-def hook_input(stop_hook_active=False, transcript=None):
+def hook_input(stop_hook_active=False, transcript=None, event="Stop"):
     d = {
         "session_id": SID,
         "turn_id": "t-1",
         "cwd": CWD,
-        "hook_event_name": "Stop",
+        "hook_event_name": event,
         "stop_hook_active": stop_hook_active,
         "last_assistant_message": "done",
         "transcript_path": transcript,
@@ -286,6 +286,50 @@ def test_defer_when_stop_hook_active(tmp: Path) -> None:
     except json.JSONDecodeError:
         out2 = {}
     check("steers on fresh stop", out2.get("decision") == "block", proc2.stdout[:200])
+
+
+def test_checkpoint_warns_once(tmp: Path) -> None:
+    print("test: PreToolUse/PostToolUse warn once per window")
+    home, sessions, env, _ = make_sandbox(tmp)
+    resets = time.time() + 3600
+    write_rollout(sessions, used=92.0, resets_at=resets)
+    proc = run_cli(["checkpoint"], env, hook_input(event="PreToolUse"))
+    check("exit 0", proc.returncode == 0, proc.stderr[-200:])
+    try:
+        out = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        out = {}
+    hook_out = out.get("hookSpecificOutput") or {}
+    check("PreToolUse event name", hook_out.get("hookEventName") == "PreToolUse", proc.stdout[:200])
+    check("additionalContext mentions HANDOFF.md", "HANDOFF.md" in hook_out.get("additionalContext", ""))
+
+    proc2 = run_cli(["checkpoint"], env, hook_input(event="PostToolUse"))
+    check("same window warns once", proc2.stdout.strip() == "", proc2.stdout[:200])
+    st = state(home)["threads"].get(SID, {})
+    check("warned window recorded", st.get("warned_window") == int(resets // 60), str(st))
+
+
+def test_checkpoint_quantizes_reset_time(tmp: Path) -> None:
+    print("test: a small reset-time drift does not re-warn in the same window")
+    home, sessions, env, _ = make_sandbox(tmp)
+    resets = (int(time.time()) + 3600) // 60 * 60 + 10
+    write_rollout(sessions, used=92.0, resets_at=resets)
+    run_cli(["checkpoint"], env, hook_input(event="PreToolUse"))
+    write_rollout(sessions, used=93.0, resets_at=resets + 2)
+    proc = run_cli(["checkpoint"], env, hook_input(event="PostToolUse"))
+    check("same minute: no second warning", proc.stdout.strip() == "", proc.stdout[:200])
+
+
+def test_checkpoint_stays_quiet(tmp: Path) -> None:
+    print("test: checkpoint stays quiet below threshold and when exhausted")
+    home, sessions, env, _ = make_sandbox(tmp)
+    write_rollout(sessions, used=12.0, resets_at=time.time() + 3600)
+    below = run_cli(["checkpoint"], env, hook_input(event="PreToolUse"))
+    check("below threshold: no output", below.stdout.strip() == "", below.stdout[:200])
+
+    write_rollout(sessions, used=100.0, resets_at=time.time() + 3600)
+    exhausted = run_cli(["checkpoint"], env, hook_input(event="PostToolUse"))
+    check("exhausted: no output", exhausted.stdout.strip() == "", exhausted.stdout[:200])
 
 
 def test_resume_dispatch(tmp: Path) -> None:
@@ -687,12 +731,15 @@ def test_install_requires_hook_approval(tmp: Path) -> None:
     data = json.loads(hj.read_text(encoding="utf-8"))
     check("existing Stop hook preserved", any(
         foreign in group["hooks"] for group in data["hooks"]["Stop"]))
-    for event in ("Stop", "SessionStart"):
+    for event in ("Stop", "SessionStart", "PreToolUse", "PostToolUse"):
         ours = [h for g in data["hooks"][event] for h in g["hooks"]
                 if "codex_auto_startstop.py" in h.get("command", "")]
         check(f"{event}: exactly one command", len(ours) == 1)
         check(f"{event}: clear status", bool(ours and ours[0].get(
             "statusMessage", "").startswith("codex-auto-startstop:")))
+        if event in ("PreToolUse", "PostToolUse"):
+            check(f"{event}: match-all matcher",
+                  bool(ours and ours[0].get("matcher") == ".*"))
     initial = hj.read_bytes()
     initial_mtime = hj.stat().st_mtime_ns
     second = run_cli(["install"], env)
@@ -714,6 +761,10 @@ def test_install_requires_hook_approval(tmp: Path) -> None:
         for g in remaining["hooks"]["Stop"] for h in g["hooks"]))
     check("uninstall removes SessionStart handler",
           "SessionStart" not in remaining["hooks"])
+    check("uninstall removes PreToolUse handler",
+          "PreToolUse" not in remaining["hooks"])
+    check("uninstall removes PostToolUse handler",
+          "PostToolUse" not in remaining["hooks"])
 
 
 def test_install_refuses_broken_hooks(tmp: Path) -> None:
@@ -756,7 +807,12 @@ def test_reinstall_consolidates_old_hooks(tmp: Path) -> None:
 def test_platform_hook_commands(tmp: Path) -> None:
     print("test: plugin and standalone hook commands are platform-safe")
     plugin_hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
-    for event, subcommand in (("Stop", "stop"), ("SessionStart", "session-start")):
+    for event, subcommand in (
+        ("Stop", "stop"),
+        ("SessionStart", "session-start"),
+        ("PreToolUse", "checkpoint"),
+        ("PostToolUse", "checkpoint"),
+    ):
         handler = plugin_hooks["hooks"][event][0]["hooks"][0]
         expected_windows = f'py -3 "%PLUGIN_ROOT%\\codex_auto_startstop.py" {subcommand}'
         check(f"{event}: Unix command retained", handler.get("command", "").endswith(f" {subcommand}"))
@@ -815,6 +871,9 @@ def main() -> int:
         test_steer,
         test_dedupe_and_new_window,
         test_defer_when_stop_hook_active,
+        test_checkpoint_warns_once,
+        test_checkpoint_quantizes_reset_time,
+        test_checkpoint_stays_quiet,
         test_resume_dispatch,
         test_resume_skips_on_activity,
         test_session_start,

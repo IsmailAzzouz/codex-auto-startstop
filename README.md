@@ -8,11 +8,16 @@
 
 Automatically hand off a Codex task before a usage limit and resume it in the same session after the limit resets.
 
-Uses Codex's `Stop` and `SessionStart` hooks, with no third-party Python dependencies.
+Uses Codex's `PreToolUse`, `PostToolUse`, `Stop`, and `SessionStart` hooks, with no
+third-party Python dependencies.
 
 ## How it works
 
 At the end of a turn, the `Stop` hook checks the session's locally recorded usage. When the configured threshold is reached, it asks Codex to write a `HANDOFF.md` summary and stop. A detached helper then schedules a continuation through `codex queue` after the reset. The `SessionStart` hook can re-arm a pending continuation after a restart.
+
+The `PreToolUse` and `PostToolUse` hooks run the same check at every tool call. When
+the threshold is reached, they inject the handoff instruction once per window. This
+gives a long turn an earlier warning, before its next turn boundary.
 
 By default, the tool monitors the 5-hour usage window at 85%. It can also monitor the weekly window. Optional reset credits can bypass the handoff when a redemption succeeds.
 
@@ -45,7 +50,13 @@ flowchart TD
     Q -- No --> S["Continue normally"]
 ```
 
-*The Stop hook runs only at turn boundaries.* Reaching the threshold cannot interrupt an ongoing turn; its handoff instruction is not a guarantee that Codex will write the file. If Codex is already exhausted, the hook can schedule recovery without asking the model to write a report. If the machine is off at reset, the helper cannot deliver the message until Codex runs again and SessionStart re-arms it. Resume is optional, and existing user activity prevents an automatic interruption.
+*The tool hooks check usage only when a tool runs, and the Stop hook checks at a
+turn boundary.* Reaching the threshold cannot interrupt a model response already in
+flight, and the handoff instruction is not a guarantee that Codex will write the
+file. If Codex is already exhausted, the hook can schedule recovery without asking
+the model to write a report. If the machine is off at reset, the helper cannot
+deliver the message until Codex runs again and SessionStart re-arms it. Resume is
+optional, and existing user activity prevents an automatic interruption.
 
 ## Requirements
 
@@ -66,7 +77,10 @@ codex plugin marketplace add IsmailAzzouz/codex-auto-startstop
 codex plugin add codex-auto-startstop@codex-auto-startstop
 ```
 
-Restart Codex, **review the `Stop` and `SessionStart` commands and explicitly approve them** in the interactive hook review flow. Installing the plugin does not grant execution permission. Verify the installation with `codex plugin list`. If the desktop app does not show an approval prompt, use the interactive CLI to review pending hooks.
+Restart Codex, **review the hook commands and explicitly approve them** in the
+interactive hook review flow. Installing the plugin does not grant execution
+permission. Verify the installation with `codex plugin list`. If the desktop app
+does not show an approval prompt, use the interactive CLI to review pending hooks.
 
 ### Standalone
 
@@ -82,11 +96,11 @@ git clone https://github.com/IsmailAzzouz/codex-auto-startstop.git
 py -3 .\codex-auto-startstop\codex_auto_startstop.py install
 ```
 
-The installer copies the script to `~/.codex/auto-startstop/`, creates a default configuration, seeds the editable handoff prompt (see [Handoff prompt](#handoff-prompt)), and registers the hooks in `~/.codex/hooks.json`. **It never edits `config.toml` to trust hooks automatically.** Open interactive Codex, inspect the two registered commands, and explicitly approve each one before expecting them to run. An untrusted hook will be skipped.
+The installer copies the script to `~/.codex/auto-startstop/`, creates a default configuration, seeds the editable handoff prompt (see [Handoff prompt](#handoff-prompt)), and registers the hooks in `~/.codex/hooks.json`. **It never edits `config.toml` to trust hooks automatically.** Open interactive Codex, inspect the registered commands, and explicitly approve each one before expecting them to run. An untrusted hook will be skipped.
 
 ### Recognizing hooks in Codex
 
-For standalone installs, commands point to `~/.codex/auto-startstop/codex_auto_startstop.py` with `stop` or `session-start`. On Windows they use Windows-safe double quotes. Plugin hooks use `python3` and `${PLUGIN_ROOT}` on Linux/macOS, and the official `commandWindows` override (`py -3` and `%PLUGIN_ROOT%`) on Windows. Both handlers have a descriptive `statusMessage`.
+For standalone installs, commands point to `~/.codex/auto-startstop/codex_auto_startstop.py` with `stop`, `session-start`, or `checkpoint`. On Windows they use Windows-safe double quotes. Plugin hooks use `python3` and `${PLUGIN_ROOT}` on Linux/macOS, and the official `commandWindows` override (`py -3` and `%PLUGIN_ROOT%`) on Windows. Each handler has a descriptive `statusMessage`.
 
 Some Codex versions display **"Hook 1", "Hook 2", or "unknown"** rather than a custom title. Codex currently lacks a supported per-hook display-name field: `statusMessage` helps in expanded details but does not override every client's row title. Identify hooks by their **event, source, and command**. See the [upstream naming limitation](https://github.com/openai/codex/issues/41611).
 
@@ -176,6 +190,7 @@ python3 "$script" status --thread <session-uuid>
 
 ## Limitations
 
+- The `PreToolUse` and `PostToolUse` hooks run only when a tool runs. A turn with no tool calls reaches only the `Stop` hook.
 - The `Stop` hook runs at turn boundaries; it cannot interrupt a turn that has already reached the usage limit.
 - The handoff is an instruction to Codex, not a guarantee that `HANDOFF.md` will be written. If it is missing, the continuation message asks Codex to reconstruct the task status.
 - If the machine is off when a reset occurs, the helper cannot run. The `SessionStart` hook can re-arm pending work when the session is opened again.

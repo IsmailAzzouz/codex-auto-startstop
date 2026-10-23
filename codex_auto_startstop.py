@@ -5,7 +5,12 @@ codex-auto-startstop — automatic "wrap up" + auto-resume around Codex's usage 
 How it works
 ------------
 Codex (CLI >= 0.160) has a stable hooks system (Claude-Code style). This tool installs
-two hooks plus a tiny resume scheduler:
+four hooks plus a tiny resume scheduler:
+
+  * PreToolUse / PostToolUse hooks -> at every tool call, read the session's own
+                          rate-limit snapshot. At the threshold they inject the
+                          steering message once per window, so a long turn sees
+                          the warning before its turn boundary.
 
   * Stop hook          -> at every turn end, reads the session's own rate-limit snapshot
                           from its rollout file. When the 5h window reaches STOP_PERCENT,
@@ -31,6 +36,7 @@ so it can never break a Codex session.
 Subcommands (used by Codex hooks / install / humans):
   stop            hook entry point (stdin: Codex Stop hook JSON)
   session-start   hook entry point (stdin: Codex SessionStart hook JSON)
+  checkpoint      hook entry point (stdin: Codex PreToolUse/PostToolUse hook JSON)
   sleeper         background helper (detached); one-shot with --once
   status          show rate-limit + auto-startstop state for a session
   credits         show available usage-limit reset credits (app-server RPC)
@@ -986,6 +992,98 @@ def cmd_stop(_args) -> int:
     return 0
 
 
+def cmd_checkpoint(_args) -> int:
+    """Codex PreToolUse/PostToolUse hook: surface the handoff threshold mid-turn.
+
+    A Stop hook runs only at a turn boundary, so a long turn can reach the
+    limit before the model sees the handoff request. This hook runs the same
+    check at every tool call and injects the steering message once per window.
+    It never blocks a tool call.
+    """
+    inp = _read_stdin_json()
+    event = str(inp.get("hook_event_name") or "")
+    if event not in ("PreToolUse", "PostToolUse"):
+        return 0
+    sid = str(inp.get("session_id") or "").strip()
+    if not sid:
+        return 0
+    cwd = Path(str(inp.get("cwd") or os.getcwd()))
+    if not cwd.is_absolute() or not cwd.is_dir():
+        log(f"checkpoint: invalid cwd {cwd}; using {Path.cwd()}")
+        cwd = Path.cwd()
+    cfg = load_config()
+    now = time.time()
+
+    with state_lock():
+        st = load_state()
+        t = st["threads"].setdefault(sid, {})
+        t["cwd"] = str(cwd)
+        t["last_seen"] = now
+        rollout = find_rollout(sid, inp.get("transcript_path"))
+        if rollout:
+            t["rollout"] = str(rollout)
+        elif t.get("rollout"):
+            rollout = Path(t["rollout"])
+
+        # One lock and one save for the whole decision. The finally clause
+        # persists session metadata on every path, including early returns.
+        try:
+            if not rollout:
+                return 0
+            rl, _src = read_last_rate_limits(rollout)
+            if not rl:
+                return 0
+            sel = select_window(cfg, rl)
+            if not sel or sel["exhausted"]:
+                return 0
+            limit = sel["name"]
+            used = sel["used"]
+            window = sel["resets_at"]
+            # resets_at identifies the window. Quantize it to the minute so a
+            # refreshed snapshot with the same window still dedupes.
+            window_key = (
+                int(window // 60)
+                if window is not None
+                else f"unknown:{int(now // 3600)}"
+            )
+            if (
+                t.get("warned_window") == window_key
+                and t.get("warned_limit", "5h") == limit
+            ):
+                return 0
+            handoff = cwd / str(cfg.get("handoff_file", "HANDOFF.md"))
+            reason = render(
+                cfg["stop_message"],
+                percent=used,
+                window=sel["label"],
+                handoff_file=cfg.get("handoff_file", "HANDOFF.md"),
+                handoff_path=str(handoff),
+                reset_local=fmt_reset(window),
+                minutes_left=max(0.0, ((window or now) - now) / 60.0),
+            )
+            _print_hook_output(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": event,
+                        "additionalContext": reason,
+                    }
+                }
+            )
+            # Mark only after the output succeeds. A failed write leaves the
+            # window unmarked, so the next tool call retries the warning.
+            t["warned_window"] = window_key
+            t["warned_limit"] = limit
+            t["warned_at"] = now
+            log(
+                f"checkpoint: {event} warn session={sid} limit={limit} "
+                f"used={used:.1f}% window={window}"
+            )
+            return 0
+        finally:
+            save_state(st)
+    return 0
+
+
 def cmd_session_start(_args) -> int:
     inp = _read_stdin_json()
     sid = str(inp.get("session_id") or "").strip()
@@ -1108,9 +1206,19 @@ def _hooks_json_command(cfg: dict, subcommand: str) -> str:
     return f"{shlex.quote(python)} {shlex.quote(str(script))} {subcommand}"
 
 
+_HOOK_SUBCOMMANDS = {
+    "Stop": "stop",
+    "SessionStart": "session-start",
+    "PreToolUse": "checkpoint",
+    "PostToolUse": "checkpoint",
+}
+
+
 _HOOK_STATUS = {
     "Stop": "codex-auto-startstop: check usage and prepare a handoff",
     "SessionStart": "codex-auto-startstop: re-arm a pending continuation",
+    "PreToolUse": "codex-auto-startstop: check usage before a tool call",
+    "PostToolUse": "codex-auto-startstop: check usage after a tool call",
 }
 
 
@@ -1140,10 +1248,14 @@ def _merge_hook_entry(data: dict, event: str, command: str) -> bool:
         "timeout": 60,
         "statusMessage": _HOOK_STATUS[event],
     }
+    if event in ("PreToolUse", "PostToolUse"):
+        # An explicit match-all matcher. An omitted matcher is not a portable
+        # way to select every tool across Codex versions.
+        desired["matcher"] = ".*"
     found = False
     changed = False
     retained = []
-    subcommand = "stop" if event == "Stop" else "session-start"
+    subcommand = _HOOK_SUBCOMMANDS[event]
     for group in groups:
         updated = []
         for handler in group["hooks"]:
@@ -1178,7 +1290,7 @@ def _remove_hook_entry(data: dict, event: str) -> bool:
     if not isinstance(hooks, dict):
         return False
     groups = hooks.get(event, [])
-    subcommand = "stop" if event == "Stop" else "session-start"
+    subcommand = _HOOK_SUBCOMMANDS[event]
     changed = False
     retained = []
     for group in groups:
@@ -1564,10 +1676,12 @@ def cmd_install(args) -> int:
         print(f"kept existing handoff prompt   {prompt_dst}")
 
     data.setdefault("description", "codex-auto-startstop: 5h-limit handoff and auto resume")
-    stop_cmd = _hooks_json_command(cfg, "stop")
-    ss_cmd = _hooks_json_command(cfg, "session-start")
-    _merge_hook_entry(data, "Stop", stop_cmd)
-    _merge_hook_entry(data, "SessionStart", ss_cmd)
+    commands = {
+        event: _hooks_json_command(cfg, subcommand)
+        for event, subcommand in _HOOK_SUBCOMMANDS.items()
+    }
+    for event, command in commands.items():
+        _merge_hook_entry(data, event, command)
     serialized = json.dumps(data, indent=2) + "\n"
     old = hj.read_text(encoding="utf-8") if hj.is_file() else None
     if old != serialized:
@@ -1575,13 +1689,13 @@ def cmd_install(args) -> int:
             shutil.copy2(hj, hj.with_suffix(".json.auto-startstop.bak"))
         _atomic_write_text(hj, serialized)
     print(f"hooks {'updated' if old != serialized else 'unchanged'}          {hj}")
-    print(f"  Stop         -> {stop_cmd}")
-    print(f"  SessionStart -> {ss_cmd}")
+    for event, command in commands.items():
+        print(f"  {event:<12} -> {command}")
 
     # Installing a command is NOT permission to execute it.
     # Leave config.toml and its trusted_hash entries completely untouched.
     print()
-    print("Installed, but NOT trusted. Review these two commands in Codex's")
+    print("Installed, but NOT trusted. Review these commands in Codex's")
     print("interactive hook trust UI (or Settings > Hooks), then approve")
     print("only the hooks you recognize. Do not bypass hook trust.")
     print("On some Codex builds rows are Hook 1 / Hook 2 / unknown;")
@@ -1603,8 +1717,9 @@ def cmd_uninstall(args) -> int:
         except json.JSONDecodeError:
             data = None
         if isinstance(data, dict):
-            changed = _remove_hook_entry(data, "Stop")
-            changed = _remove_hook_entry(data, "SessionStart") or changed
+            changed = False
+            for event in _HOOK_SUBCOMMANDS:
+                changed = _remove_hook_entry(data, event) or changed
             if changed:
                 shutil.copy2(hj, hj.with_suffix(".json.auto-startstop.bak"))
                 _atomic_write_text(hj, json.dumps(data, indent=2) + "\n")
@@ -1629,6 +1744,9 @@ def main(argv=None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("stop", help="Codex Stop hook entry point (stdin JSON)").set_defaults(func=cmd_stop)
+    sub.add_parser(
+        "checkpoint", help="Codex PreToolUse/PostToolUse hook entry point (stdin JSON)"
+    ).set_defaults(func=cmd_checkpoint)
     sub.add_parser("session-start", help="Codex SessionStart hook entry point (stdin JSON)").set_defaults(
         func=cmd_session_start
     )
@@ -1667,7 +1785,7 @@ def main(argv=None) -> int:
         return args.func(args) or 0
     except Exception:  # noqa: BLE001 - hooks must never break a session
         log("FATAL: " + traceback.format_exc())
-        if args.command in ("stop", "session-start"):
+        if args.command in _HOOK_SUBCOMMANDS.values():
             return 0
         raise
 
