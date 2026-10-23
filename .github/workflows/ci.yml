@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.10", "3.13"]
     steps:
       - uses: actions/checkout@v4
@@ -24,13 +24,15 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Validate release version metadata
-        run: python3 scripts/release_version.py check
+        run: python scripts/release_version.py check
       - name: Test automatic release logic
-        run: python3 tests/release_test.py
+        run: python tests/release_test.py
+        if: runner.os != 'Windows'
       - name: Simulate release publication and reruns (offline Git/GitHub)
-        run: python3 tests/release_integration_test.py
+        run: python tests/release_integration_test.py
+        if: runner.os != 'Windows'
       - name: Run synthetic hooks tests
-        run: python3 tests/synthetic_test.py
+        run: python tests/synthetic_test.py
 
   release:
     name: Publish GitHub release

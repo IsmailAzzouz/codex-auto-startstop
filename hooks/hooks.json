@@ -7,6 +7,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/codex_auto_startstop.py\" stop",
+            "commandWindows": "py -3 \"%PLUGIN_ROOT%\\codex_auto_startstop.py\" stop",
             "timeout": 60,
             "statusMessage": "codex-auto-startstop: check usage and prepare a handoff"
           }
@@ -19,6 +20,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/codex_auto_startstop.py\" session-start",
+            "commandWindows": "py -3 \"%PLUGIN_ROOT%\\codex_auto_startstop.py\" session-start",
             "timeout": 60,
             "statusMessage": "codex-auto-startstop: re-arm a pending continuation"
           }

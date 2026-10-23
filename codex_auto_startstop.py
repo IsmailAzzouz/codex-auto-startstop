@@ -53,11 +53,12 @@ import glob
 import json
 import os
 import re
-import selectors
+import queue
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -389,6 +390,30 @@ def select_window(cfg: dict, rl: dict):
     return max(fired, key=lambda w: (w["used"] - w["threshold"], w["used"]))
 
 
+def describe_trigger_windows(cfg: dict, rl: dict) -> tuple[bool, str]:
+    """Return a concise, truthful log summary of every configured window.
+
+    A stop below the configured threshold is the usual path, not an error. The
+    old ``no usable rate-limit window`` message hid the observed percentages
+    and made that normal path indistinguishable from a changed transcript
+    schema. Keep the values and thresholds in the log so operators can audit
+    each hook run without parsing the rollout themselves.
+    """
+    readable = False
+    details = []
+    for name in _trigger_windows(cfg):
+        key, _label, threshold_key, default = _LIMIT_DEFS[name]
+        threshold = float(cfg.get(threshold_key, default))
+        window = rl.get(key) or {}
+        used = window.get("used_percent")
+        if isinstance(used, (int, float)):
+            readable = True
+            details.append(f"{name}={float(used):.1f}% used (threshold={threshold:.1f}%)")
+        else:
+            details.append(f"{name}=unavailable (threshold={threshold:.1f}%)")
+    return readable, "; ".join(details)
+
+
 # --------------------------------------------------------------------------- state
 
 
@@ -586,8 +611,23 @@ def notify_desktop(cfg: dict, title: str, body: str) -> None:
 # --------------------------------------------------------------------------- codex queue
 
 
+def split_command(command: str) -> list[str]:
+    """Split a configured executable command on the current platform.
+
+    ``shlex``'s POSIX mode consumes backslashes in Windows paths (for example,
+    ``C:\\Python312\\python.exe`` becomes an invalid executable). Its Windows
+    mode intentionally preserves surrounding quotes, so trim those quotes after
+    splitting. Config values are executable commands, not arbitrary shell code;
+    this keeps them as argv for ``subprocess`` on every platform.
+    """
+    parts = shlex.split(command, posix=os.name != "nt")
+    if os.name == "nt":
+        return [part.strip("\"'") for part in parts]
+    return parts
+
+
 def codex_queue(cfg: dict, session_id: str, message: str, cwd=None):
-    base = shlex.split(str(cfg.get("codex_bin") or "codex"))
+    base = split_command(str(cfg.get("codex_bin") or "codex"))
     cmd = base + ["queue", "--thread", session_id, "--message", message]
     try:
         proc = subprocess.run(
@@ -859,7 +899,17 @@ def cmd_stop(_args) -> int:
 
     sel = select_window(cfg, rl)
     if not sel:
-        log(f"stop: no usable rate-limit window for {sid} (rollout={rollout})")
+        readable, details = describe_trigger_windows(cfg, rl)
+        if readable:
+            log(
+                f"stop: below threshold session={sid} trigger={cfg.get('trigger', '5h')} "
+                f"{details} (rollout={rollout})"
+            )
+        else:
+            log(
+                f"stop: no readable rate-limit data session={sid} trigger={cfg.get('trigger', '5h')} "
+                f"{details} (rollout={rollout})"
+            )
         return 0
     limit = sel["name"]
     used = sel["used"]
@@ -1050,6 +1100,11 @@ def _hooks_json_command(cfg: dict, subcommand: str) -> str:
     installed = auto_startstop_home() / "codex_auto_startstop.py"
     if installed.is_file():
         script = installed
+    if os.name == "nt":
+        # Codex executes commandWindows through the Windows command processor.
+        # POSIX single quotes from shlex.quote are literal there and make the
+        # generated hook impossible to launch.
+        return f'"{python}" "{script}" {subcommand}'
     return f"{shlex.quote(python)} {shlex.quote(str(script))} {subcommand}"
 
 
@@ -1064,13 +1119,13 @@ def _is_our_hook_command(command: object, subcommand: str) -> bool:
     if not isinstance(command, str):
         return False
     try:
-        parts = shlex.split(command, posix=os.name != "nt")
+        parts = split_command(command)
     except ValueError:
         return False
-    if len(parts) < 2 or parts[-1].strip('"') != subcommand:
+    if len(parts) < 2 or parts[-1].strip("\"'") != subcommand:
         return False
     return any(
-        part.strip('"').replace("\\", "/").endswith("/codex_auto_startstop.py")
+        part.strip("\"'").replace("\\", "/").endswith("/codex_auto_startstop.py")
         for part in parts[:-1]
     )
 
@@ -1148,7 +1203,7 @@ def _remove_hook_entry(data: dict, event: str) -> bool:
 
 def _rpc_request(codex_bin: str, requests: list, timeout: float = 30.0):
     """Talk to `codex app-server --listen stdio://` and return id->result map."""
-    argv = shlex.split(codex_bin) + ["app-server", "--listen", "stdio://"]
+    argv = split_command(codex_bin) + ["app-server", "--listen", "stdio://"]
     proc = subprocess.Popen(
         argv,
         stdin=subprocess.PIPE,
@@ -1159,19 +1214,35 @@ def _rpc_request(codex_bin: str, requests: list, timeout: float = 30.0):
     )
     results = {}
     pending = [req for req in requests if req.get("id") is not None]
+
+    # selectors cannot watch anonymous stdout pipes on Windows. A tiny reader
+    # thread gives the same bounded, non-blocking protocol loop on Windows,
+    # Linux, and macOS.
+    lines: queue.Queue[str | None] = queue.Queue()
+
+    def read_stdout() -> None:
+        assert proc.stdout is not None
+        try:
+            for line in iter(proc.stdout.readline, ""):
+                lines.put(line)
+        finally:
+            lines.put(None)
+
+    reader = threading.Thread(target=read_stdout, name="codex-app-server-reader", daemon=True)
+    reader.start()
     try:
+        assert proc.stdin is not None
         for req in requests:
             proc.stdin.write(json.dumps(req) + "\n")
         proc.stdin.flush()
 
-        sel = selectors.DefaultSelector()
-        sel.register(proc.stdout, selectors.EVENT_READ)
         deadline = time.time() + timeout
         while pending and time.time() < deadline:
-            if not sel.select(max(0.1, deadline - time.time())):
+            try:
+                line = lines.get(timeout=min(0.1, max(0.001, deadline - time.time())))
+            except queue.Empty:
                 continue
-            line = proc.stdout.readline()
-            if not line:
+            if line is None:
                 break
             try:
                 msg = json.loads(line)

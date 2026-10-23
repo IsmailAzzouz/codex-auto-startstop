@@ -204,12 +204,31 @@ def _json(s: str) -> dict:
 
 
 def test_below_threshold(tmp: Path) -> None:
-    print("test: below threshold -> allow stop, no state")
+    print("test: below threshold -> allow stop and log the observed value")
     home, sessions, env, _ = make_sandbox(tmp)
     write_rollout(sessions, used=12.0, resets_at=time.time() + 3600)
     proc = run_cli(["stop"], env, hook_input())
     check("exit 0", proc.returncode == 0, proc.stderr[-200:])
     check("no output", proc.stdout.strip() == "", proc.stdout[:200])
+    log_text = (home / "auto-startstop" / "auto-startstop.log").read_text(encoding="utf-8")
+    check("log identifies a below-threshold decision", "stop: below threshold" in log_text, log_text[-300:])
+    check("log includes observed usage and threshold", "5h=12.0% used (threshold=80.0%)" in log_text, log_text[-300:])
+
+
+def test_missing_limit_data_logs_clearly(tmp: Path) -> None:
+    print("test: missing rate-limit data is distinguishable from below threshold")
+    home, sessions, env, _ = make_sandbox(tmp)
+    rollout = write_rollout(sessions, used=12.0, resets_at=time.time() + 3600)
+    rollout.write_text(
+        rollout.read_text(encoding="utf-8").replace('"used_percent": 12.0', '"unrecognized_percent": 12.0'),
+        encoding="utf-8",
+    )
+    proc = run_cli(["stop"], env, hook_input())
+    check("exit 0", proc.returncode == 0, proc.stderr[-200:])
+    check("no output", proc.stdout.strip() == "", proc.stdout[:200])
+    log_text = (home / "auto-startstop" / "auto-startstop.log").read_text(encoding="utf-8")
+    check("log identifies unreadable data", "stop: no readable rate-limit data" in log_text, log_text[-300:])
+    check("log identifies the unavailable configured window", "5h=unavailable (threshold=80.0%)" in log_text, log_text[-300:])
 
 
 def test_steer(tmp: Path) -> None:
@@ -734,12 +753,65 @@ def test_reinstall_consolidates_old_hooks(tmp: Path) -> None:
     check("old script path replaced", "/older/" not in commands[0], str(commands))
 
 
+def test_platform_hook_commands(tmp: Path) -> None:
+    print("test: plugin and standalone hook commands are platform-safe")
+    plugin_hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    for event, subcommand in (("Stop", "stop"), ("SessionStart", "session-start")):
+        handler = plugin_hooks["hooks"][event][0]["hooks"][0]
+        expected_windows = f'py -3 "%PLUGIN_ROOT%\\codex_auto_startstop.py" {subcommand}'
+        check(f"{event}: Unix command retained", handler.get("command", "").endswith(f" {subcommand}"))
+        check(
+            f"{event}: commandWindows uses the Python launcher",
+            handler.get("commandWindows") == expected_windows,
+            repr(handler.get("commandWindows")),
+        )
+
+    if os.name != "nt":
+        return
+
+    home, _sessions, env, _ = make_sandbox(tmp)
+    home.mkdir(parents=True, exist_ok=True)
+    env = dict(env)
+    env["CODEX_HOME"] = str(home)
+    installed = run_cli(["install"], env)
+    data = json.loads((home / "hooks.json").read_text(encoding="utf-8"))
+    command = data["hooks"]["Stop"][0]["hooks"][0]["command"]
+    check("standalone command uses Windows double quotes", command.startswith('"') and "'" not in command, command)
+    # This is the same command string Codex invokes on Windows. No stdin makes
+    # the hook harmless while still proving the command can start Python.
+    proc = subprocess.run(
+        command,
+        shell=True,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    check("standalone command runs via cmd.exe", proc.returncode == 0, proc.stderr[-300:])
+    check("standalone installer succeeds", installed.returncode == 0, installed.stderr[-300:])
+
+    plugin_env = dict(env)
+    plugin_env["PLUGIN_ROOT"] = str(ROOT)
+    plugin_command = plugin_hooks["hooks"]["Stop"][0]["hooks"][0]["commandWindows"]
+    plugin_proc = subprocess.run(
+        plugin_command,
+        shell=True,
+        capture_output=True,
+        text=True,
+        env=plugin_env,
+        timeout=30,
+    )
+    check("plugin commandWindows runs via cmd.exe", plugin_proc.returncode == 0, plugin_proc.stderr[-300:])
+
+
 def main() -> int:
     tests = [
         test_install_requires_hook_approval,
         test_install_refuses_broken_hooks,
         test_reinstall_consolidates_old_hooks,
+        test_platform_hook_commands,
         test_below_threshold,
+        test_missing_limit_data_logs_clearly,
         test_steer,
         test_dedupe_and_new_window,
         test_defer_when_stop_hook_active,

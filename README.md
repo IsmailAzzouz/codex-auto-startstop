@@ -51,7 +51,7 @@ flowchart TD
 
 - Codex CLI 0.160 or later
 - Python 3.10 or later
-- Linux or macOS (tested by CI)
+- Windows, Linux, or macOS (tested by CI)
 
 Automatic message delivery uses Codex's app-server and queue support. Check your CLI version with `codex --version`.
 
@@ -75,11 +75,18 @@ git clone https://github.com/IsmailAzzouz/codex-auto-startstop.git
 python3 codex-auto-startstop/codex_auto_startstop.py install
 ```
 
+On Windows PowerShell, use the Python launcher instead:
+
+```powershell
+git clone https://github.com/IsmailAzzouz/codex-auto-startstop.git
+py -3 .\codex-auto-startstop\codex_auto_startstop.py install
+```
+
 The installer copies the script to `~/.codex/auto-startstop/`, creates a default configuration, seeds the editable handoff prompt (see [Handoff prompt](#handoff-prompt)), and registers the hooks in `~/.codex/hooks.json`. **It never edits `config.toml` to trust hooks automatically.** Open interactive Codex, inspect the two registered commands, and explicitly approve each one before expecting them to run. An untrusted hook will be skipped.
 
 ### Recognizing hooks in Codex
 
-For standalone installs, commands point to `~/.codex/auto-startstop/codex_auto_startstop.py` with `stop` or `session-start`. For plugins, they reference `${PLUGIN_ROOT}/codex_auto_startstop.py`. Both handlers have a descriptive `statusMessage`.
+For standalone installs, commands point to `~/.codex/auto-startstop/codex_auto_startstop.py` with `stop` or `session-start`. On Windows they use Windows-safe double quotes. Plugin hooks use `python3` and `${PLUGIN_ROOT}` on Linux/macOS, and the official `commandWindows` override (`py -3` and `%PLUGIN_ROOT%`) on Windows. Both handlers have a descriptive `statusMessage`.
 
 Some Codex versions display **"Hook 1", "Hook 2", or "unknown"** rather than a custom title. Codex currently lacks a supported per-hook display-name field: `statusMessage` helps in expanded details but does not override every client's row title. Identify hooks by their **event, source, and command**. See the [upstream naming limitation](https://github.com/openai/codex/issues/41611).
 
@@ -142,12 +149,29 @@ python3 codex_auto_startstop.py status --thread <session-id>
 python3 codex_auto_startstop.py credits
 ```
 
+On Windows, replace `python3` with `py -3` and `/` with `\` where a path is shown.
+
 For standalone installations, the script is at `~/.codex/auto-startstop/codex_auto_startstop.py`.
 
 Runtime state and logs are stored in `~/.codex/auto-startstop/`. To inspect the log:
 
 ```bash
 tail -f ~/.codex/auto-startstop/auto-startstop.log
+```
+
+Every normal `Stop` run records the observed quota and threshold, for example:
+
+```text
+stop: below threshold session=<id> trigger=5h 5h=41.0% used (threshold=85.0%) (...)
+```
+
+`no readable rate-limit data` is reserved for a missing or incompatible quota snapshot. It is not used when a valid quota is simply below the threshold.
+
+For a plugin install, the runtime state remains under `~/.codex/auto-startstop/`, but the script lives in the plugin directory. To run `status` without a source checkout:
+
+```bash
+script="$(find ~/.codex -type f -name codex_auto_startstop.py -path '*codex-auto-startstop*' -print -quit)"
+python3 "$script" status --thread <session-uuid>
 ```
 
 ## Limitations
@@ -173,6 +197,12 @@ For a standalone installation:
 python3 ~/.codex/auto-startstop/codex_auto_startstop.py uninstall
 ```
 
+On Windows PowerShell:
+
+```powershell
+py -3 $HOME\.codex\auto-startstop\codex_auto_startstop.py uninstall
+```
+
 Add `--purge` to the standalone uninstall command to remove runtime state. This does not automatically remove previously trusted hook entries from Codex's configuration. Entries written by versions before 1.0.1 are not revoked automatically; review them manually if necessary.
 
 ## Tests
@@ -181,14 +211,14 @@ Add `--purge` to the standalone uninstall command to remove runtime state. This 
 python3 tests/synthetic_test.py
 ```
 
-The synthetic suite tests threshold decisions, per-window deduplication, resume scheduling, activity checks, and reset-credit decisions without consuming real account credits. GitHub Actions runs it on Linux and macOS with Python 3.10 and 3.13.
+The synthetic suite tests threshold decisions, per-window deduplication, resume scheduling, activity checks, reset-credit decisions, and platform-specific command generation without consuming real account credits. GitHub Actions runs it on Windows, Linux, and macOS with Python 3.10 and 3.13. The release-shell tests run on Linux and macOS because release publication is a Bash workflow.
 
 Reset-credit redemption is tested with a simulated app-server; it has not been verified by spending a real credit as part of the test suite.
 
 
 ## Development and automatic GitHub releases
 
-All pull requests and pushes to `main` run the **four CI test jobs** (Linux and macOS with Python 3.10 and 3.13). They cover the hooks, installation safety, and release-version logic. **A failed or cancelled test job prevents publication.** Forked pull requests run with read-only permissions and never publish releases.
+All pull requests and pushes to `main` run the **six CI test jobs** (Windows, Linux, and macOS with Python 3.10 and 3.13). They cover the hooks, installation safety, and release-version logic; Bash-only release simulations run on Linux and macOS. **A failed or cancelled test job prevents publication.** Forked pull requests run with read-only permissions and never publish releases.
 
 For each successful, new push to `main`, the release job:
 
