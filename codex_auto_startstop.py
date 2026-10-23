@@ -80,7 +80,7 @@ try:  # POSIX only; hook state locking degrades to a no-op elsewhere
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 
 # Update check: GitHub redirects /releases/latest to the current tag. This is
 # one HTTPS request to a web page, not an API call, so there is no token and no
