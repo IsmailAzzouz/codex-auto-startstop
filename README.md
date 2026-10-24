@@ -13,7 +13,7 @@ third-party Python dependencies.
 
 ## How it works
 
-At the end of a turn, the `Stop` hook checks the session's locally recorded usage. When the configured threshold is reached, it asks Codex to write a `HANDOFF.md` summary and stop. A detached helper then schedules a continuation through `codex queue` after the reset. The `SessionStart` hook can re-arm a pending continuation after a restart.
+At the end of a turn, the `Stop` hook checks the session's locally recorded usage. When the configured threshold is reached, it asks Codex to write a `HANDOFF.md` summary and stop. A detached helper then runs `codex exec resume <SESSION_ID>` with the handoff message after the reset. This starts a real turn even when the thread is unloaded. If an existing Codex client owns the thread, it falls back to `codex queue`. The `SessionStart` hook can re-arm a pending continuation after a restart.
 
 The `PreToolUse` and `PostToolUse` hooks run the same check at every tool call. When
 the threshold is reached, they inject the handoff instruction once per window. This
@@ -50,7 +50,7 @@ flowchart TD
     J --> L["Wait for reset + buffer"]
     L --> M{"Session active?"}
     M -- Yes --> N["Skip auto-resume"]
-    M -- No --> O["codex queue<br/>Same session"]
+    M -- No --> O["codex exec resume<br/>or queue for active writer"]
     O --> P["Resume task<br/>Read HANDOFF.md<br/>or reconstruct context"]
 
     style D fill:#e8f1ff,stroke:#5684bd,color:#172b45
@@ -73,7 +73,7 @@ optional, and existing user activity prevents an automatic interruption.
 - Python 3.10 or later
 - Windows, Linux, or macOS (tested by CI)
 
-Automatic message delivery uses Codex's app-server and queue support. Check your CLI version with `codex --version`.
+Default unattended continuation uses `codex exec resume`, which executes the saved thread without an open TUI. The optional queue mode requires a loaded thread for automatic dispatch. Check your CLI version with `codex --version`.
 
 ## Installation
 
@@ -126,6 +126,7 @@ Configuration is read from `~/.codex/auto-startstop/config.json`. The standalone
 | `stop_percent_weekly` | `90.0` | Weekly usage threshold (%) |
 | `resume_buffer_sec` | `90` | Delay in seconds after the reset |
 | `resume` | `true` | Enable automatic continuation |
+| `resume_method` | `"auto"` | `auto`: execute a saved thread; queue only if an active writer prevents a second executor. `exec`: only run headless. `queue`: only enqueue (may wait for manual session reopening). |
 | `handoff_file` | `"HANDOFF.md"` | Handoff filename in the session working directory |
 | `notify_desktop` | `true` | Enable desktop notifications when supported |
 | `check_updates` | `true` | Check GitHub for a newer release at session start |
@@ -225,7 +226,10 @@ python3 "$script" status --thread <session-uuid>
 - If the machine is off when a reset occurs, the helper cannot run. The `SessionStart` hook can re-arm pending work when the session is opened again.
 - For a weekly reset several days away, the detached helper remains alive until the scheduled continuation (unless the machine or process stops); there is no eight-hour cutoff.
 - If there is user activity after the reset, automatic continuation is skipped to avoid interrupting ongoing work.
-- Queued continuation depends on the Codex CLI's app-server and message queue behavior.
+- Default automatic continuation runs non-interactively in the original working directory. Changes and transcript are saved in the same session, but a closed Codex UI will not automatically reopen.
+- If a headless run fails or is interrupted, the helper stops rather than repeating potentially non-idempotent edits. Inspect `status` and the log before retrying manually.
+- `resume_method: "queue"` is kept for compatibility. An unloaded thread can accept a queued message **without starting a turn** (see [upstream issue #44491](https://github.com/openai/codex/issues/44491)); use the default `auto` for unattended work.
+- Automatic continuation requires the original project directory, an installed Codex CLI and a valid Codex login. It cannot execute while the machine is powered off.
 
 ## Uninstall
 
@@ -255,7 +259,7 @@ Add `--purge` to the standalone uninstall command to remove runtime state. This 
 python3 tests/synthetic_test.py
 ```
 
-The synthetic suite tests threshold decisions, per-window deduplication, resume scheduling, activity checks, reset-credit decisions, and platform-specific command generation without consuming real account credits. GitHub Actions runs it on Windows, Linux, and macOS with Python 3.10 and 3.13. The release-shell tests run on Linux and macOS because release publication is a Bash workflow.
+The synthetic suite tests threshold decisions, per-window deduplication, headless resume execution, active-writer queue fallback, protection against duplicate attempts, activity checks, reset-credit decisions, and platform-specific command generation without consuming real account credits. GitHub Actions runs it on Windows, Linux, and macOS with Python 3.10 and 3.13. The release-shell tests run on Linux and macOS because release publication is a Bash workflow.
 
 Reset-credit redemption is tested with a simulated app-server; it has not been verified by spending a real credit as part of the test suite.
 

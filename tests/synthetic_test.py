@@ -135,6 +135,9 @@ def make_sandbox(tmp: Path):
         "        sys.stdout.flush()\n"
         "else:\n"
         "    _log(sys.argv[1:])\n"
+        "    if sys.argv[1:3] == ['exec', 'resume'] and os.environ.get('FAKE_EXEC_FAILURE'):\n"
+        "        print(os.environ['FAKE_EXEC_FAILURE'], file=sys.stderr)\n"
+        "        sys.exit(1)\n"
         "    print('Queued message 123 for thread abc')\n",
         encoding="utf-8",
     )
@@ -336,21 +339,65 @@ def test_checkpoint_stays_quiet(tmp: Path) -> None:
 
 
 def test_resume_dispatch(tmp: Path) -> None:
-    print("test: resume due -> codex queue invoked")
+    print("test: resume due -> codex exec resume actually runs")
     home, sessions, env, fake_log = make_sandbox(tmp)
     env["CODEX_AUTO_STARTSTOP_FORCE_RESUME_IN"] = "0"
     write_rollout(sessions, used=92.0, resets_at=time.time() + 3600)
-    run_cli(["stop"], env, hook_input())
+    run_cli(["stop"], env, {**hook_input(), "cwd": str(tmp)})
     proc = run_cli(["resume-check", "--thread", SID], env)
     check("exit 0", proc.returncode == 0, proc.stderr[-300:])
     calls = fake_calls(fake_log)
     check("fake codex called once", len(calls) == 1, str(calls))
     if calls:
         argv = calls[0]
-        check("queue --thread <sid>", argv[:3] == ["queue", "--thread", SID], str(argv))
-        check("resume message present", len(argv) >= 5 and argv[3] == "--message" and "reset" in argv[4])
+        check("exec resume <sid>", argv[:3] == ["exec", "resume", SID], str(argv))
+        check("resume message present", len(argv) >= 4 and "reset" in argv[3])
     st = state(home)["threads"].get(SID, {})
-    check("resume_sent_at recorded", bool(st.get("resume_sent_at")), str(st))
+    check("resume_sent_at recorded after execution", bool(st.get("resume_sent_at")), str(st))
+    check("resume delivery says executed", st.get("resume_delivery") == "executed", str(st))
+
+
+def test_resume_loaded_writer_uses_queue(tmp: Path) -> None:
+    print("test: active writer -> use queue rather than a second headless writer")
+    home, sessions, env, fake_log = make_sandbox(tmp)
+    env["CODEX_AUTO_STARTSTOP_FORCE_RESUME_IN"] = "0"
+    env["FAKE_EXEC_FAILURE"] = "thread already has an active writer (code -32600)"
+    write_rollout(sessions, used=92.0, resets_at=time.time() + 3600)
+    run_cli(["stop"], env, {**hook_input(), "cwd": str(tmp)})
+    proc = run_cli(["resume-check", "--thread", SID], env)
+    calls = fake_calls(fake_log)
+    check("active writer: exit 0", proc.returncode == 0, proc.stderr[-200:])
+    check("active writer: exec attempted before queue", len(calls) == 2 and calls[0][:2] == ["exec", "resume"] and calls[1][:3] == ["queue", "--thread", SID], str(calls))
+    st = state(home)["threads"].get(SID, {})
+    check("active writer: queue status clear", st.get("resume_delivery") == "queued for active session", str(st))
+
+
+def test_resume_exec_failure_is_not_replayed(tmp: Path) -> None:
+    print("test: failed headless work never runs twice without inspection")
+    home, sessions, env, fake_log = make_sandbox(tmp)
+    env["CODEX_AUTO_STARTSTOP_FORCE_RESUME_IN"] = "0"
+    env["FAKE_EXEC_FAILURE"] = "unexpected execution failure"
+    write_rollout(sessions, used=92.0, resets_at=time.time() + 3600)
+    run_cli(["stop"], env, {**hook_input(), "cwd": str(tmp)})
+    first = run_cli(["resume-check", "--thread", SID], env)
+    again = run_cli(["resume-check", "--thread", SID], env)
+    st = state(home)["threads"].get(SID, {})
+    check("exec error is reported", first.returncode == 1, first.stderr[-200:])
+    check("exec marks failure", st.get("resume_failed") is True, str(st))
+    check("failed exec does not retry", again.returncode == 0 and len(fake_calls(fake_log)) == 1, str(fake_calls(fake_log)))
+
+
+def test_legacy_queue_mode(tmp: Path) -> None:
+    print("test: explicit queue mode remains available")
+    home, sessions, env, fake_log = make_sandbox(tmp)
+    write_config(home, resume_method="queue")
+    env["CODEX_AUTO_STARTSTOP_FORCE_RESUME_IN"] = "0"
+    write_rollout(sessions, used=92.0, resets_at=time.time() + 3600)
+    run_cli(["stop"], env, hook_input())
+    proc = run_cli(["resume-check", "--thread", SID], env)
+    calls = fake_calls(fake_log)
+    check("queue mode exits 0", proc.returncode == 0, proc.stderr[-200:])
+    check("queue mode uses queue CLI", len(calls) == 1 and calls[0][:3] == ["queue", "--thread", SID], str(calls))
 
 
 def test_resume_skips_on_activity(tmp: Path) -> None:
@@ -1004,6 +1051,9 @@ def main() -> int:
         test_checkpoint_quantizes_reset_time,
         test_checkpoint_stays_quiet,
         test_resume_dispatch,
+        test_resume_loaded_writer_uses_queue,
+        test_resume_exec_failure_is_not_replayed,
+        test_legacy_queue_mode,
         test_resume_skips_on_activity,
         test_session_start,
         test_update_notice,
