@@ -65,6 +65,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -97,6 +98,7 @@ DEFAULT_CONFIG = {
     "resume_buffer_sec": 90,
     "handoff_file": "HANDOFF.md",
     "resume": True,
+    "resume_method": "auto",  # auto | exec | queue
     "codex_bin": "codex",
     "python": sys.executable or "python3",
     "notify_desktop": True,
@@ -669,6 +671,29 @@ def codex_queue(cfg: dict, session_id: str, message: str, cwd=None):
         return False, str(exc)
 
 
+def codex_exec_resume(cfg: dict, session_id: str, message: str, cwd=None):
+    """Execute the saved thread, even if no TUI/app has it loaded."""
+    if not cwd or not Path(cwd).is_dir():
+        return False, "original session working directory is missing"
+    cmd = split_command(str(cfg.get("codex_bin") or "codex"))
+    cmd += ["exec", "resume", session_id, message]
+    try:
+        with tempfile.TemporaryFile() as output:
+            # A long agent turn must not time out just because it took >5 min.
+            proc = subprocess.run(
+                cmd, stdin=subprocess.DEVNULL, stdout=output,
+                stderr=subprocess.STDOUT, cwd=str(cwd),
+            )
+            output.seek(0, os.SEEK_END)
+            output.seek(max(0, output.tell() - 4096))
+            tail = output.read().decode("utf-8", errors="replace").strip()
+        if proc.returncode == 0:
+            return True, "codex exec resume completed"
+        return False, f"codex exec resume exit {proc.returncode}: {tail[-600:]}"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"codex exec resume error: {exc}"
+
+
 # --------------------------------------------------------------------------- sleeper
 
 
@@ -712,6 +737,13 @@ def ensure_sleeper(session_id: str) -> bool:
         if not t.get("resume_at"):
             return False
         if t.get("resume_sent_at") or t.get("resume_skipped") or t.get("resume_failed"):
+            return False
+        if t.get("resume_started_at"):
+            if _pid_alive(t.get("sleeper_pid")):
+                return True
+            t["resume_failed"] = True
+            t["resume_result"] = "interrupted execution; inspect previous edits before retrying"
+            save_state(st)
             return False
         if os.environ.get("CODEX_AUTO_STARTSTOP_NO_SPAWN"):
             log(f"sleeper: spawn suppressed (NO_SPAWN) for {session_id}")
@@ -772,6 +804,9 @@ def cmd_sleeper(args) -> int:
         if t.get("resume_sent_at") or t.get("resume_skipped") or t.get("resume_failed"):
             log(f"sleeper: already finished for {sid}; exit")
             return 0
+        if t.get("resume_started_at"):
+            log(f"sleeper: headless resume already started for {sid}; exit")
+            return 0
         now = time.time()
         resume_at = float(t["resume_at"])
         if now < resume_at:
@@ -825,6 +860,41 @@ def cmd_sleeper(args) -> int:
             reset_local=fmt_reset(t.get("window_resets_at")),
             percent=float(t.get("steered_used") or 0.0),
         )
+        method = str(cfg.get("resume_method") or "auto").lower()
+        if method not in ("auto", "exec", "queue"):
+            method = "auto"
+        if method in ("auto", "exec"):
+            # Claim once, before running an arbitrary-length agent turn.
+            # Re-executing after a crash could repeat non-idempotent work.
+            with state_lock():
+                st = load_state()
+                tt = st["threads"].setdefault(sid, {})
+                if tt.get("resume_started_at") or tt.get("resume_sent_at"):
+                    log(f"sleeper: duplicate resume prevented for {sid}")
+                    return 0
+                tt["resume_started_at"] = time.time()
+                save_state(st)
+            ok, out = codex_exec_resume(cfg, sid, msg, cwd=t.get("cwd"))
+            delivery = "executed"
+            if not ok and method == "auto" and "already has an active writer" in out.lower():
+                # Only a loaded active writer can reliably drain the queue.
+                ok, out = codex_queue(cfg, sid, msg, cwd=t.get("cwd"))
+                delivery = "queued for active session"
+            with state_lock():
+                st = load_state()
+                tt = st["threads"].setdefault(sid, {})
+                tt["resume_result"] = out[:400]
+                tt["resume_delivery"] = delivery
+                if ok:
+                    tt["resume_sent_at"] = time.time()
+                else:
+                    tt["resume_failed"] = True
+                save_state(st)
+            log(f"sleeper: resume {delivery} for {sid}: success={ok} {out[:300]}")
+            notify_desktop(cfg, "codex-auto-startstop", "Resume completed" if ok else "Resume failed - check logs")
+            return 0 if ok else 1
+
+        # Explicit legacy mode: successful enqueue does not wake an unloaded thread.
         ok, out = codex_queue(cfg, sid, msg, cwd=t.get("cwd"))
         if ok:
             with state_lock():
@@ -1100,6 +1170,9 @@ def cmd_stop(_args) -> int:
             else:
                 t["resume_at"] = now + 5 * 3600
             t.pop("resume_sent_at", None)
+            t.pop("resume_started_at", None)
+            t.pop("resume_delivery", None)
+            t.pop("resume_result", None)
             t.pop("resume_skipped", None)
             t.pop("resume_failed", None)
             t.pop("resume_attempts", None)
@@ -1327,10 +1400,13 @@ def cmd_status(args) -> int:
         elif t.get("resume_skipped"):
             print(f"resume skip: {t['resume_skipped']}")
         elif t.get("resume_failed"):
-            print("resume:      FAILED (see log)")
+            print(f"resume:      FAILED ({t.get('resume_result', 'see log')[:140]})")
+        elif t.get("resume_started_at"):
+            print(f"resume:      running since {fmt_reset(t['resume_started_at'])}")
     print(
         f"thresholds:  stop_percent={cfg.get('stop_percent')} "
-        f"weekly={cfg.get('stop_percent_weekly')} trigger={cfg.get('trigger')} resume={cfg.get('resume')}"
+        f"weekly={cfg.get('stop_percent_weekly')} trigger={cfg.get('trigger')} "
+        f"resume={cfg.get('resume')} method={cfg.get('resume_method')}"
     )
 
     print(
